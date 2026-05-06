@@ -1,0 +1,1151 @@
+You said: I need to spawn 200+ modbus TCP server simulators within the same system so they would have the same IP address, but each with a unique Port(501, 502, etc) so …
+ 
+ 
+inductiveautomation/ignition-sdk-examples
+ignition-8.3
+GITHUB
+inductiveautomation/ignition-module-tools
+master
+GITHUB
+I need to spawn 200+ modbus TCP server simulators within the same system so they would have the same IP address, but each with a unique Port(501, 502, etc) so that an real live client can connect to them. I would like to do this within our existing Ignition installation. Please analyze all of the project info along with all of the attached and let me know if this is viable and if so, which of the attached two options from the screenshots would be best(or another option if there is a better one)
+May 4
+  responded: Let me verify my understanding by checking the project knowledge for any Modbus server or TCP server capabilities I might be missing.
+Evaluated architectural trade-offs between external Python and SDK module approaches
+Evaluated architectural trade-offs between external Python and SDK module approaches
+Let me verify my understanding by checking the project knowledge for any Modbus server or TCP server capabilities I might be missing.
+Verified Ignition lacks native Modbus TCP server capability natively
+Verified Ignition lacks native Modbus TCP server capability natively
+The SDK confirms what I suspected — Ignition's Device API documentation is purely about being an OPC UA driver (a client of external devices), not hosting foreign-protocol servers. There's no native Modbus TCP server scaffolding anywhere in the platform.
+Verdict: Yes, it's viable. Go with Option 1 (external Python).
+Why Option 2 (custom SDK module) is the wrong tool:
+The Ignition SDK is built for extending Ignition's consumption side — drivers, tag providers, scripting functions, components. The OPC UA Device example in your project files looks superficially similar, but it's actually plumbing data into Ignition's internal OPC UA server using Milo's ManagedAddressSpace — it isn't opening raw TCP listeners for a foreign protocol. Going Option 2 means:
+1.	Writing a full Modbus TCP server stack from scratch in Java (or wrapping j2mod/jamod) — wire protocol, transaction IDs, function codes, exception responses, register map storage. None of the SDK examples help you here.
+2.	200+ ServerSockets inside the Gateway JVM — heap pressure, thread/selector overhead, and a custom failure mode you now have to debug inside your production process.
+3.	Coupling your test harness to your system under test. This is the killer for FAT. The whole point of the FAT is to validate that your Ignition Modbus client behaves correctly against a real Modbus server. Hosting the simulator inside the same JVM creates a circular dependency and introduces stability concerns that won't exist in production with the real RTACs.
+4.	Iteration friction — every simulator tweak means rebuild .modl → sign → upload → Gateway restart. Compare to editing a Python file and Ctrl+C / python sim.py.
+Why Option 1 is the right call:
+•	pymodbus (or pyModbusTCP) makes a 200-server, port-per-instance setup roughly 50 lines of code with full async support and per-server register populations driven from CSV — which fits your existing CSV-driven simulation pattern naturally.
+•	Decoupled lifecycle: the simulator can be killed, restarted, reconfigured, or replaced without touching Ignition at all.
+•	Ignition consumes the simulators as plain Modbus TCP devices — exactly the same way it'll consume the real GCSA_RTAC_MODBUS and GCSB_RTAC_MODBUS in production. Only the IP/port changes between sim and prod, which is the cleanest possible FAT story for Robert's team.
+•	200 ports on one host is fine for the OS (well under ephemeral port limits and the 65k cap); just make sure 501–700-ish aren't colliding with anything else.
+One refinement to your diagram
+Don't have Ignition launch and manage the Python process via API call (the arrow in Image 1). Run the simulator as a proper OS service — Windows Service via NSSM, or a systemd unit on Linux — independent of Ignition. Reasons:
+•	The Gateway scripting environment isn't a great place to manage a long-lived child process lifecycle. system.util.execute() is fire-and-forget; you'd be reinventing process supervision.
+•	Keeping the simulator outside Ignition's process tree means a Gateway restart doesn't kill your sim, and a sim crash doesn't surface as a Gateway issue.
+•	It mirrors how the real RTACs will work — they're independent network endpoints Ignition simply connects to.
+If you do want runtime control from Ignition (start/stop a specific simulated device, inject a fault, swap CSV scenarios), expose a small REST API on the Python side (Flask/FastAPI, ~20 lines) and call it from Gateway scripting. That's much cleaner than process management.
+When Option 2 would actually make sense
+Only if you needed the simulators tightly bound to live Ignition tag values — e.g., an operator panel inside Perspective driving simulated PLC behavior in real time, with the simulator reading from Ignition tags. That's not your case. You're feeding canned scenario data from CSVs to validate a Modbus client cutover. External Python wins clearly.
+You said: ok, another question, what if I used this open source modbus tcp simulator instead of the custom python program from the message above?
+ok, another question, what if I used this open source modbus tcp simulator instead of the custom python program from the message above? would that work? would it be possible to launch 200+ instances of this repo? https://github.com/mgrillo75/OpenModSim
+May 4
+  responded: Let me check what OpenModSim actually is so I can answer accurately.
+Cataloging OpenModSim's architecture and scripting capabilities
+Cataloging OpenModSim's architecture and scripting capabilities
+Let me check what OpenModSim actually is so I can answer accurately.
+Evaluated GUI application feasibility versus headless architecture needs
+Evaluated GUI application feasibility versus headless architecture needs
+Short answer: Technically yes, you could launch 200+ instances. Practically, this is a worse choice than the custom Python approach — and it's worse for reasons that matter for your FAT.
+Here's why OpenModSim is the wrong shape for what you're trying to do:
+It's a Qt desktop GUI application, not a service. Looking at the repo, it's 78.5% C++ with Qt widgets, distributed as omodsim.exe / omodsim.app. There's no headless or service mode in the README — every instance opens a window. That means:
+•	200+ desktop windows on one machine. On Windows you're not just dealing with taskbar clutter — you're consuming GDI handles (Windows enforces ~10,000 per session by default), DWM resources, and per-window OS overhead. 200 is in the range where you'll start hitting weird platform limits.
+•	It can't run as a Windows Service cleanly. Services run in Session 0 with no interactive desktop; GUI apps need a real session. You'd be stuck running this in a logged-in console session on a dedicated machine, which is fragile and not the sort of thing that survives a reboot or RDP disconnect.
+•	Memory footprint is brutal at scale. Each Qt instance pulls in the full Qt runtime, widget tree, event loop, and per-instance state. Realistic per-instance RSS is 60–150 MB. Multiply by 200 → 12–30 GB just for simulator overhead, before any actual register data. Compare to a single async pymodbus process serving 200 ports, which fits comfortably in well under 200 MB total.
+Configuration management at 200× is painful. Each OpenModSim instance needs its own config (port, register map, simulation behavior). The tool stores those as .omsm files via its GUI. You'd be either: (a) hand-clicking through the GUI 200 times, or (b) generating 200 config files programmatically and launching the binary with each — at which point you're already writing the kind of orchestration code that makes the GUI tool itself redundant. With pymodbus, your 200 servers live inside one Python process driven by one CSV — the orchestration goes away entirely because there's nothing to orchestrate.
+No clean lifecycle control. You mentioned wanting to "Launch, Manage, Close via API" in your earlier diagram. With OpenModSim that means spawning 200 child processes and managing each one's PID, watching for crashes, restarting them individually. With a single pymodbus process, lifecycle is one start/stop. Fault injection (drop a server, change scenario data, simulate disconnects) is one in-process call, not 200 IPC handshakes.
+It's optimized for a different job. OpenModSim is genuinely good at what it's built for: an engineer at a workstation interactively poking at a few Modbus servers while debugging a single client connection. It has a slick Qt UI, a log viewer, JavaScript scripting, error injection — all desktop-engineer features. None of those carry over to "run 200 of them on a server in the corner of the rack."
+One narrow scenario where it could make sense: if you only need a handful of representative simulators (say, 2–4) and you specifically want the GUI-driven scripting and message inspection during interactive FAT debugging. In that case it's a fine tool — just not for 200.
+For your actual use case (200+ ports, headless, CSV-driven, lifecycle-controllable, FAT-grade), pymodbus in a single Python process remains the right answer. ~75 lines of code, one CSV input, one process to supervise, runs as a proper systemd unit or NSSM-wrapped Windows service. If it'd help, I can sketch out what that Python looks like — server-per-port factory, CSV-driven holding/input register population, and an optional Flask control endpoint so Ignition Gateway scripting can hit it for fault injection during the FAT.
+You said: understood, so with that said, is python the correct choice of language, framework, etc, to use for the simulator?
+understood, so with that said, is python the correct choice of language, framework, etc, to use for the simulator? is there a better option from a lightweight, efficient, low-complexity perspective?
+May 4
+  responded: Let me verify the current state of the main contenders before answering.
+Evaluating Python's suitability for the simulator project
+Evaluating Python's suitability for the simulator project
+Let me verify the current state of the main contenders before answering.
+Validated Python's suitability while weighing credible alternatives comprehensively
+Validated Python's suitability while weighing credible alternatives comprehensively
+Yes — Python with pymodbus is the right call for this specific scenario. I'd commit to it rather than continue language-shopping. Here's the reasoning, including the credible alternatives so you can sanity-check the decision.
+Why Python wins for this specific job:
+The work is I/O-bound, not CPU-bound. 200 servers responding to periodic Modbus reads is trivial throughput — well inside what a single-core Python asyncio event loop handles with room to spare. The performance gap between Python and a "faster" language is genuinely invisible at this scale and workload, so any argument for a different language has to be made on grounds other than runtime efficiency.
+The big find from verifying pymodbus's current state: pymodbus 3.x ships a ModbusSimulatorServer class with a built-in HTTP control surface — endpoints for register handling, call monitoring, response simulation, server start/stop, and JSON-based setup files. You're not writing a Modbus server from scratch. You're configuring one that already exists, with the fault-injection and runtime control hooks already wired up. That alone moves Python from "good choice" to "obvious choice" — every other option means more code to write. PyModbus
+A FAT simulator also gets modified mid-test. Operators want to change scenarios, inject faults, swap CSV inputs, simulate disconnects. Iteration speed matters more than runtime efficiency for test infrastructure that isn't the SUT. Python wins that dimension decisively.
+Credible alternatives, and why I wouldn't switch:
+•	Go (simonvetter/modbus, grid-x/modbus): Genuinely good fit on paper — single static binary, lower memory, fast startup. The honest trade-off is that Go server-side Modbus libraries are noticeably less feature-rich than pymodbus, and you'd be writing more code to recreate the JSON-driven config + HTTP control surface pymodbus gives you for free. Pick this only if you have a hard requirement for a single binary with zero runtime dependencies.
+•	C# / .NET with NModbus: Reasonable if your team already lives in .NET — common in industrial. .NET 8 self-contained AOT gives you a single executable. Doesn't gain anything over Python for development speed. Choose only if .NET is already the team's first language.
+•	Rust with tokio-modbus: Overkill. You're not building a flight controller. The dev-time penalty vs. Python is real; the runtime benefit is invisible at this workload.
+•	Java with j2mod: You have Java skills from the Ignition SDK side, but JVM startup, packaging friction, and Maven/Gradle ceremony give you Python's downsides without Python's iteration advantage. Skip.
+The specific stack I'd commit to:
+•	Python 3.11+ (asyncio performance improvements help)
+•	pymodbus 3.x, specifically ModbusSimulatorServer — one instance per port, or a thin orchestrator spawning N of them in one process
+•	JSON config per simulated device, generated from your existing Modbus map (a small CSV→JSON shim, ~30 lines)
+•	NSSM-wrapped Windows Service (or systemd unit on Linux) so it survives reboots and runs without an interactive session
+•	pymodbus's built-in HTTP endpoint for fault injection — you can almost certainly skip writing a custom Flask/FastAPI wrapper, since the built-in API already covers register manipulation, response simulation, and call monitoring
+The pymodbus-native ModbusSimulatorServer is the part most people miss when they roll their own simulator from scratch. Use it. You'll write substantially less code than you would with any other library in any other language.
+You said: what is the linux cli command to find out the version of python installed
+what is the linux cli command to find out the version of python installed
+May 4
+  responded: Or equivalently python3 -V.
+python3 --version
+Or equivalently python3 -V. On some older systems python --version works, but python3 is the safer bet since many distros no longer alias python to anything by default.
+If you want to see all Python versions installed on the system:
+ls /usr/bin/python*
+You said: Actually, we’re riding this whole mod bus simulator as a patch or a Band-Aid because these guys wouldn’t listen to me when I told them months ago that they wer…
+excerpt_from_previous_ _message.txt
+8 lines
+txt
+Actually, we’re riding this whole mod bus simulator as a patch or a Band-Aid because these guys wouldn’t listen to me when I told them months ago that they were gonna run into problems when they try to run MQTT as their main protocol for a industrial skater system so because they weren’t listening to me now they came to me asking to help build this this module and I have to deal with the IT group again to do this containers and I don’t wanna deal with them so I want to build this inside of ignition that way I can just install it as an ignition custom module that runs either in the runtime or on the gateway so how can I do that?And this FAT has nothing to do with this simulator or this mod bus code or anything because the FAT is about the power max system which SEL is due using an RTDS simulator and what happened was they’re not simulating all of the all of the auxiliary equipment so they’re simulating that via modus TCP on the R attack and if my company would’ve listened to me, they would’ve been able to use the mod. Bus driver from ignition cause we were already would’ve built it out but because they wanted to go MQTT they never had any protocol drivers built out on ignition so this has nothing to do with my bus. I just I don’t I don’t wanna deal with the IT group so I want to build this into ignition so I don’t have to deal with anything with a container.
+Show more
+May 5
+  responded: Got it — context completely changes things, and your reasoning is sound.
+Got it — context completely changes things, and your reasoning is sound. You own the Ignition box, you don't own the IT pipeline, and bringing in a container or a separate Python service means a ticket queue you don't want to deal with for a workaround that shouldn't have been necessary in the first place. Building it as a module that lives inside the Gateway JVM means zero IT involvement, zero new processes to register, zero firewall conversations. That's a legitimate engineering trade.
+I owe you a correction on my earlier post. The "writing the Modbus server stack from scratch" objection was wrong — there's a mature Java library that does this, and the "200 ServerSockets in the JVM" concern is real but manageable. Let me lay out what this actually looks like.
+The library: j2mod or Modbus4j
+j2mod (github.com/steveohara/j2mod) is the actively-maintained fork of jamod. Apache 2.0, supports TCP/RTU/ASCII slave (server) mode, function codes 1/2/3/4/5/6/15/16, register/coil data stores you can populate at runtime. It's a single jar, no native dependencies, and it's the de facto standard for Modbus in Java land.
+For your case, the relevant API is roughly:
+java
+ModbusSlaveFactory.createTCPSlave(port, poolSize)
+slave.addProcessImage(unitId, processImage)  // your register map
+slave.open()
+That's the whole thing. No protocol implementation work on your end. j2mod handles transaction IDs, framing, exception codes, all of it.
+Where it lives in your module
+Gateway-scope module, single hook class. The pattern matches the managed-tag-provider example in your project files almost exactly — just substitute "register a managed tag provider" with "spin up N j2mod slaves." Rough shape:
+•	GatewayHook.startup() reads config (CSV path, port range, register map source) and starts the slaves on a background thread.
+•	Each slave gets its own ModbusSlaveTCPListener bound to a unique port on 0.0.0.0 (or whatever IP you want).
+•	A managed tag provider exposes per-simulator status tags (port, connected client count, last-request timestamp) so operators can see what's running from a Perspective view without leaving the Gateway.
+•	GatewayHook.shutdown() closes all slaves cleanly.
+You already have all the scaffolding patterns in your project files — ManagedProviderGatewayHook shows the exact lifecycle structure, and the build setup from gateway-network-function and scripting-function examples gives you the Maven/scope wiring.
+The real concerns at 200 ports inside the JVM
+These are tractable, but worth being upfront about:
+Thread model. j2mod's TCP listener defaults to a thread-per-connection model with a configurable pool. With 200 listeners and one Ignition client per port, that's ~200 listener threads plus ~200 worker threads at peak, so call it 400 threads of overhead. The Gateway JVM already runs hundreds of threads — this is real but not catastrophic. Set the pool size on each slave to 1 or 2, since you have exactly one Ignition client per simulator.
+Memory. Each slave is small (low single-digit MB including the process image). 200 × that is well under a GB. Bump the Gateway's wrapper.java.maxmemory in ignition.conf by 1 GB to give yourself headroom and call it done.
+Port binding. Make sure the ports you pick don't collide with anything else on the box. Stay above 1024 to avoid root/admin issues. 5000-5200 is a safer range than 501-700 because some systems reserve low ports.
+Stability blast radius. This is the one I want to flag honestly. If the simulator has a bug that throws an unhandled exception or leaks sockets, it's running in the same JVM as your production Gateway. j2mod is mature and this risk is low, but it's not zero. Mitigations: wrap every j2mod entry point in try/catch Throwable, log via LoggerEx at error level, never let an exception propagate out of a slave thread, and put a kill switch in your config so an operator can disable all simulators without restarting the Gateway. You already know to do this, but it's worth saying out loud since the failure mode is "Gateway crash" instead of "kill the Python process."
+Module signing. You'll need a dev signing cert to install the .modl on the Gateway. If you don't already have one set up, the gradle module plugin in your project files supports skipModlSigning for unsigned modules during dev — fine for an internal box, just don't ship that to anyone else.
+Updated recommendation
+Build it as a Gateway-scope module using j2mod. It's the right answer given the actual constraints. The earlier "external Python" advice was correct for a generic FAT setup but wrong for your situation, where the IT friction cost is the dominant factor.
+Want me to sketch out the module structure — GatewayHook, the slave manager class, a CSV-driven config loader, and the Maven/Gradle build config that mirrors your existing examples? I can target Ignition 8.3.3 specifically and use the same patterns from your managed-tag-provider and scripting-function examples so it slots into your existing build workflow.
+You said: In addition.
+In addition. So that won't be a problem. Just wanna make sure that we're using all of the available options to us from ignition, especially from the gateway. Take a look at this and let me know if it helps.
+https://www.sdk-docs.inductiveautomation.com/docs/8.3/to-83-upgrade-guide/
+https://www.sdk-docs.inductiveautomation.com/docs/intro
+https://www.sdk-docs.inductiveautomation.com/docs/simple-scripting/
+https://www.sdk-docs.inductiveautomation.com/docs/simple-scripting/examine-example
+https://www.sdk-docs.inductiveautomation.com/docs/simple-scripting/build-install
+https://www.sdk-docs.inductiveautomation.com/docs/simple-scripting/add-function
+https://www.sdk-docs.inductiveautomation.com/docs/example-modules/
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/gradle-tutorials/
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/gradle-tutorials/creating-a-custom-datasink-for-store-and-forward
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/working-with-platform-services
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/exposing-data-to-the-system
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/extending-ignition-with-extension-points
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/projects-and-project-resources
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/storing-data-with-persistentrecords/
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/storing-data-with-persistentrecords/uploading-a-file-to-the-gateway
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-gateway/providing-status-information
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-designer/designer-to-gateway-communication-rpc
+https://www.sdk-docs.inductiveautomation.com/docs/programming-for-the-designer/scripting
+Show more
+May 5
+  responded: Let me pull the most relevant pages — especially the 8.
+Let me pull the most relevant pages — especially the 8.3 upgrade guide, gateway extension points, and the persistent records / status info pages — since those will tell me what platform services we should lean on for this module.
+Searched the web
+Searched the web
+Yes, this helps a lot. The 8.3 upgrade guide changes the architecture more than I'd assumed, and a few of these pages point to platform services that genuinely improve the design. Here's what's relevant and how it changes the recommended structure.
+The big shift: 8.3 module lifecycle is start-once
+Modules are no longer started or stopped while the Gateway is already running. Instead, they are set up and started as the Gateway is starting, and shut down as the Gateway is shutting down. Any module changes while the Gateway is running will wait until a Gateway restart to take effect. inductiveautomation
+This matters because your simulators are exactly the kind of thing operators will want to start/stop/reconfigure mid-test. You don't want "tweak a CSV row" to require a Gateway restart. The implication: build all per-simulator runtime control inside the module's runtime state (a manager class with start/stop/reconfigure methods), not via module enable/disable. Then expose it through scripting functions, which gives operators live control without touching module lifecycle.
+What to pull in from the SDK toolkit
+Extension Points for the simulator type itself. This is the right pattern for what you're building. The doc lists the existing extension point types (alarm notification, OPC connections, tag history providers, OPC UA module device, etc.) — your module would register a new "Modbus Simulator Device" extension point. Then operators create instances through the standard Gateway config UI, exactly like they configure any other device connection. Each simulator instance is just a configured profile with its own settings (port, register map source, scenario CSV path). This buys you the entire config UI + persistence + lifecycle plumbing for free instead of rolling your own. The 8.3 OPC UA section confirms this is now the standard pattern — DeviceExtensionPoint replaced the old DeviceType, and the opc-ua-device example in your project files shows the modern shape.
+Config Resources, not PersistentRecords. The 8.3 guide is clear that PersistentRecord is being phased out. Your project files even include the opc-ua-device example with ExampleDeviceConfig as a record (with @FormCategory, @FormField, @DefaultValue annotations) and ExampleDeviceExtensionPoint showing the new pattern. Use that. The annotations auto-generate the Gateway config form, so you don't write any UI code — operators get a real form to configure each simulator with port, register map, etc.
+Scripting functions for live runtime control. Use the simple-scripting pattern from the docs and your scripting-function example to expose system.modbussim.start("sim1"), system.modbussim.stop("sim1"), system.modbussim.injectFault("sim1", ...), system.modbussim.reloadCsv("sim1"). Operators drive everything from a Perspective button or a scripting console, no module restart needed. This is your fault-injection / FAT control surface and it costs almost no code with the new @JythonElement annotation.
+Status Panels. Genuinely useful here. Status panels are similar to the homepage panels in how they're created and delivered, but they are shown on the status page. They are suitable for showing in-depth information that would be appropriate for troubleshooting and performance monitoring. They are implemented through the INamedTab interface, though you would extend the AbstractNamedTab class. Build one of these so the Gateway's Status section gets a "Modbus Simulators" tab showing each simulator's port, bound state, connected client count, last request timestamp, and request rate. This is exactly the kind of operator visibility you want and you don't have to build a Perspective view to get it. inductiveautomation
+Optional: a Managed Tag Provider for live status tags. Your project has the managed-tag-provider example. If you want simulator status visible as tags (so they can drive Perspective views, alarms, scripts), spin up a managed provider and emit one folder per simulator with status/connection/lastRequest tags. Cheap to add, very useful for FAT dashboards.
+Things from your link list I'd specifically skip
+•	Store and Forward custom datasink — irrelevant to this use case.
+•	Designer-to-Gateway RPC — only matters if you build a Designer UI for the simulator. The Gateway config form generated from the record annotations covers operator config; scripting covers runtime control. Skip Designer scope entirely. That alone removes a build target, a hook class, and a whole RPC plumbing layer.
+•	Project resources — your config is system-level (per-Gateway), not per-project. The Config Resource API used by extension points handles persistence; you don't need project resources.
+•	Vision — no client-scope code needed. Gateway-only module.
+Updated module structure
+Single-scope (Gateway) module. Three meaningful classes plus build config:
+1.	ModbusSimulatorGatewayHook — setup() initializes the manager and registers the extension point with the device extension manager; startup() no-op (work is done lazily as profiles come online); shutdown() cleanly closes all running simulators. Also wires the scripting module, status panel, and (optional) managed tag provider.
+2.	ModbusSimulatorExtensionPoint extends DeviceExtensionPoint<ModbusSimulatorConfig> — operator-facing type registration. Its createDevice() is what spins up the j2mod slave for that profile.
+3.	ModbusSimulatorConfig (record with @FormCategory/@FormField/@DefaultValue annotations) — port, IP bind, register map source path/CSV, unit ID, plus per-simulator behavior knobs.
+4.	ModbusSimulatorManager — internal lifecycle and state. Holds the j2mod slave references, exposes start/stop/inject methods called by both the extension point and scripting functions.
+5.	ModbusSimulatorScriptModule (+ AbstractModbusSimulatorScriptModule in common) — the scripting surface for live FAT control.
+6.	ModbusSimulatorStatusPanel extends AbstractNamedTab — the Gateway status page tab.
+This is a meaningfully better design than what I sketched in the previous message. It uses the platform services properly: operators configure simulators through the same UI they use for any other device, runtime control works without restarts, and status visibility is built into the same Gateway pages they already use.
+The 8.3-specific wrinkles to plan for
+•	Module acceptance — Modules in the user-lib/modules folder will no longer automatically be loaded on startup without a corresponding entry in data/modules.json indicating positive acceptance of the module. First install on the Gateway will require the operator to accept it through the Gateway UI. One-time annoyance. inductiveautomation
+•	Servlet API package change — Java Servlet Spec will be upgraded from 4.EE8 to 6.EE10, which means all servlet APIs will have their packages renamed from javax.* to jakarta.*. Doesn't affect us directly (no servlets in this module) but if you copy code from older examples watch the imports. inductiveautomation
+•	Scripting annotation rename — a new annotation @JythonElement is used instead of @ScriptFunction. Use @JythonElement in any code you copy from the older scripting-function example. Your AbstractScriptModule.java in the project files already uses the new annotation, so reference that one. inductiveautomation
+•	No PersistentRecord — the upgrade guide explicitly walks through migrating away. The opc-ua-device example's ExampleDeviceSettings.java is even marked @Deprecated(since = "8.3.0"). Don't follow that example for new code; follow ExampleDeviceConfig (the record version) instead.
+Want me to draft the actual module skeleton — the extension point class, the config record with the form annotations, the j2mod-based device implementation, and a Gradle build matching your project's opc-ua-device example for 8.3.3? That would give you something importable into IntelliJ and buildable out of the box.
+You said: So actually all I like for you to do right now is build a specifications and requirement outline for the development and implementation of this ignition custom…
+So actually all I like for you to do right now is build a specifications and requirement outline for the development and implementation of this ignition custom SDK module, but I want to start as simple and bare bones as possible like literally all I need is a module that will launch and simulate 200 devices on those 200 different ports at a very minimum that doesn’t need to be any operator interactions or anything like that we’ll do that later
+May 5
+  responded: Modbus Multi-Port Simulator Module — Specifications & Requirements (v0.
+Modbus Multi-Port Simulator Module — Specifications & Requirements (v0.1, MVP)
+1. Purpose
+Build a Gateway-scope Ignition 8.3.3 module that, on Gateway startup, launches N Modbus TCP slave (server) listeners on a single host IP, each on a unique TCP port. Listeners stay running for the lifetime of the Gateway and shut down cleanly when the Gateway shuts down. No UI, no operator controls, no runtime configuration. The module exists so an Ignition Modbus client (running on the same Gateway or elsewhere) can connect to up to 200+ simulated Modbus servers without external processes or containers.
+2. Scope
+In scope (MVP)
+•	Gateway-scope-only module (no Designer, no Client, no Vision).
+•	Single hook class implementing AbstractGatewayModuleHook.
+•	Hardcoded or static-config-file-driven list of (port, unit ID) entries.
+•	One Modbus TCP slave per port, all bound to 0.0.0.0 (listening on all interfaces of the Gateway host).
+•	Each slave responds to function codes 1, 2, 3, 4, 5, 6, 15, 16 with deterministic, static register/coil contents (e.g., all registers initialized to a value derived from port number, or all zeros).
+•	Clean startup and shutdown integrated with module lifecycle.
+•	Gateway log output indicating which ports started, which failed, and final count of running slaves.
+Out of scope (deferred to later phases)
+•	Operator UI (no Gateway homepage panel, no status tab, no Perspective view).
+•	Configuration through Ignition extension points or the ExtensionPoint API.
+•	Configuration records / ExampleDeviceConfig-style form generation.
+•	Scripting functions (system.modbussim.*).
+•	Managed tag provider exposing simulator status as tags.
+•	Live runtime start/stop/reload without Gateway restart.
+•	CSV-driven register map population.
+•	Fault injection, error simulation, scripted register behavior.
+•	Per-port authentication, TLS, or access controls.
+•	Designer-to-Gateway RPC.
+•	Module signing for production distribution (dev-unsigned only for MVP).
+3. Target Environment
+•	Ignition platform: 8.3.3 (matches existing ignition-4-20 project).
+•	JVM: bundled with Ignition 8.3.3 (Java 17).
+•	Host OS: whatever the Gateway is installed on (Windows or Linux); module is OS-agnostic.
+•	Network: single host IP, ports in a configurable contiguous range (default range to be selected; see §4.2).
+•	Module dependencies declared in module.xml: none beyond the Ignition platform.
+4. Functional Requirements
+4.1 Module Lifecycle
+•	FR-1. On GatewayHook.setup(GatewayContext), store the GatewayContext reference and read the static port list (see §4.2).
+•	FR-2. On GatewayHook.startup(LicenseState), instantiate and start one Modbus TCP slave per configured port. Startup must not block the Gateway startup path for an extended time; slave instantiation should occur on a background thread if total startup time would otherwise exceed ~5 seconds.
+•	FR-3. On GatewayHook.shutdown(), stop and close every running slave. All sockets must be released before the method returns.
+•	FR-4. Module must follow 8.3 module lifecycle semantics: started once at Gateway startup, stopped once at Gateway shutdown. No mid-run reconfiguration is supported in MVP.
+4.2 Port Configuration (MVP — Static)
+•	FR-5. The list of ports is defined statically in code (a constant int[] or generated range) for the MVP. No external config file required.
+•	FR-6. Default configuration: 200 contiguous ports starting at a base port. Suggested default range: 5020–5219 (avoids the standard Modbus port 502, avoids privileged ports below 1024, and is unlikely to collide with common services). Final base port to be confirmed by Miguel before implementation.
+•	FR-7. Each port maps to a Modbus unit ID. Default: unit ID = 1 for every port (identity is by port, not unit ID — Ignition will configure one device connection per port).
+4.3 Modbus Slave Behavior
+•	FR-8. Each slave listens on 0.0.0.0:<port> (all interfaces) using TCP.
+•	FR-9. Each slave exposes the following address spaces, each sized to 1024 entries:
+•	Coils (FC 1, 5, 15)
+•	Discrete inputs (FC 2)
+•	Holding registers (FC 3, 6, 16)
+•	Input registers (FC 4)
+•	FR-10. Initial register/coil values are deterministic and trivial. Suggested seed: holdingRegister[i] = port_lastTwoDigits for all i (e.g., port 5020 → all holding registers = 20). This makes it trivial to verify from an Ignition client which simulated device it connected to without any external instrumentation.
+•	FR-11. Writes (FC 5, 6, 15, 16) must succeed and persist for the slave's lifetime, but no behavior is triggered by writes in MVP.
+•	FR-12. Each slave's TCP listener uses a small thread pool (1–2 worker threads per slave) since we expect at most one Ignition client per port.
+4.4 Logging
+•	FR-13. On startup, log at INFO level: total number of slaves attempted, number successfully started, number failed (with port and exception per failure).
+•	FR-14. On shutdown, log at INFO level: number of slaves stopped cleanly.
+•	FR-15. Log per-slave bind events at DEBUG level only (not INFO) to avoid 200 INFO lines on a normal startup.
+•	FR-16. Use LoggerEx or SLF4J via the Ignition logging system. No System.out.
+5. Non-Functional Requirements
+5.1 Stability
+•	NFR-1. No exception thrown by any slave thread may propagate out and destabilize the Gateway. Every entry point into the Modbus library is wrapped in try/catch Throwable, with errors logged and the offending slave isolated.
+•	NFR-2. Failure to bind any single port (e.g., port already in use) must not prevent other slaves from starting. Failed slaves are logged and skipped; the module continues operating with the remaining slaves.
+•	NFR-3. Gateway shutdown must complete even if individual slaves throw on close. Each slave.close() call is wrapped and exceptions are logged but swallowed.
+5.2 Resource Footprint
+•	NFR-4. With 200 idle slaves and one connected client per slave, total module heap usage should remain under 500 MB. Total thread count contributed by the module should remain under 600 threads (≈3 per slave including listener and worker).
+•	NFR-5. The Gateway's ignition.conf wrapper.java.maxmemory should be raised by 1 GB above its current setting to provide headroom. This is a deployment note, not a module requirement.
+5.3 Build & Packaging
+•	NFR-6. Built with Gradle, following the structure of the existing opc-ua-device example in the project files. Uses io.ia.sdk.modl plugin for module assembly.
+•	NFR-7. Single Gradle subproject (gateway only). No common, client, or designer subprojects.
+•	NFR-8. Module signing skipped for MVP (skipModlSigning = true). The .modl is installable on a development Gateway with module acceptance enabled.
+•	NFR-9. External Modbus library dependency bundled into the module via modlImplementation (j2mod or equivalent — final library selection in §6).
+5.4 Compatibility
+•	NFR-10. Targets Ignition 8.3.3 SDK only. No backward compatibility with 8.1 required.
+•	NFR-11. Uses 8.3-current APIs only: AbstractGatewayModuleHook, LicenseState, current GatewayContext. No deprecated APIs.
+6. Library Selection
+Selected: j2mod (Apache 2.0 license).
+Rationale: Mature, actively maintained, single jar, supports TCP slave mode, supports all required function codes, no native dependencies, integrates cleanly with the Ignition module classloader.
+Coordinate to confirm at build time: latest stable on Maven Central (currently in the com.ghgande:j2mod artifact group — version to be pinned during implementation).
+7. Module Identity
+Field	Value
+Module ID	com.gcs.modbus.simulator (suggested — confirm with Miguel)
+Module name	Modbus Multi-Port Simulator
+Module description	Hosts N Modbus TCP slave instances on contiguous ports for FAT and integration testing.
+Required Ignition version	8.3.3
+Free module	true
+Hook scope	Gateway only
+Hook class	com.gcs.modbus.simulator.gateway.ModbusSimulatorGatewayHook
+8. Project Structure
+modbus-multiport-simulator/
+├── settings.gradle.kts
+├── build.gradle.kts                     # root, applies io.ia.sdk.modl plugin
+├── gradle/
+│   └── libs.versions.toml               # ignition + j2mod versions
+└── gateway/
+    ├── build.gradle.kts                 # gateway subproject build
+    └── src/main/java/com/gcs/modbus/simulator/gateway/
+        ├── ModbusSimulatorGatewayHook.java       # entry point
+        └── ModbusSimulatorManager.java           # holds j2mod slave references, start/stop logic
+9. Class Responsibilities (MVP)
+ModbusSimulatorGatewayHook
+•	Extends AbstractGatewayModuleHook.
+•	Holds a single ModbusSimulatorManager instance.
+•	setup(): instantiate manager.
+•	startup(): call manager.startAll() on a background thread.
+•	shutdown(): call manager.stopAll(), await completion.
+•	Provides Gateway-scoped logger.
+ModbusSimulatorManager
+•	Holds the static port list as a constant.
+•	Holds a Map<Integer, ModbusTCPListener> of running slaves keyed by port.
+•	startAll(): iterate ports, create + start one slave per port, populate map. Log summary.
+•	stopAll(): iterate map, close each slave, clear map. Log summary.
+•	All slave construction wrapped in try/catch Throwable to enforce NFR-1 / NFR-2.
+•	Each slave's process image populated per FR-10 before listener opens.
+10. Acceptance Criteria
+The MVP is complete when all of the following are true:
+1.	The .modl file builds via ./gradlew buildModule (or equivalent) with no errors.
+2.	The .modl installs on a clean Ignition 8.3.3 Gateway after module acceptance.
+3.	On Gateway startup, the Gateway log shows an INFO line of the form: Modbus Simulator: started 200 / 200 slaves on ports 5020–5219.
+4.	From the same machine or another machine on the network, a Modbus TCP client (any tool — pymodbus, OpenModSim in client mode, an Ignition device connection) can connect to <gateway-host>:5020 through <gateway-host>:5219 and successfully read holding register 0, receiving the value seeded per FR-10.
+5.	On Gateway shutdown, the Gateway log shows: Modbus Simulator: stopped 200 slaves. No bind: address already in use errors appear on the next Gateway restart.
+6.	Gateway memory and thread usage during a 30-minute idle run remain stable (no growth over time).
+7.	If any single port (e.g., 5020) is occupied prior to Gateway startup, the module logs the failure and continues — 199 slaves start successfully, the Gateway reports healthy, and item 4 above passes for the remaining 199 ports.
+11. Open Items for Miguel to Confirm Before Implementation
+#	Item	Default if no answer
+Q1	Base port for the 200-port range	5020 (range 5020–5219)
+Q2	Module ID string	com.gcs.modbus.simulator
+Q3	Bind interface	0.0.0.0 (all interfaces)
+Q4	Number of slaves for MVP	200
+Q5	Static seed value for registers	port last two digits (FR-10)
+Q6	Java package root	com.gcs.modbus.simulator
+12. Deliverables
+1.	Source repository (suggested: extend the existing ignition-4-20 repo or create a new modbus-multiport-simulator repo).
+2.	Single buildable Gradle project producing one unsigned .modl file.
+3.	README documenting:
+•	How to build (./gradlew buildModule).
+•	How to install on the Gateway (module acceptance steps).
+•	The static port range and what to expect in the logs.
+•	How to verify with a simple Modbus client query against one port.
+4.	No automated tests required for MVP. Manual verification per §10 acceptance criteria.
+________________________________________
+That's the bare-bones spec. It deliberately leaves out everything we discussed adding later (extension points, config records, scripting functions, status panels, managed tag providers) so the first cut is small, focused, and easy to verify. Once it's running and proven on the Gateway, we layer the operator-facing pieces on top without disturbing the core.
+Want me to take a pass at the open items in §11 with concrete recommendations, or are you good to fill those in yourself?
+You said: So I just had a moment of enlightenment maybe a little bit of universe justification but as I stated earlier, the whole reason we’re in this situation is becau…
+ 
+pdf
+ 
+pdf
+ 
+So I just had a moment of enlightenment maybe a little bit of universe justification but as I stated earlier, the whole reason we’re in this situation is because this company that hired me Volta grid does not listen to me. They are a power systems company power generation they are excellent top notch power generation and they hired me as an automation consultant. I have 20+ years of experience in industrial automation with controllers, etc. and they don’t listen to me. I told them several months ago that they were running into problems when they tried to run these MQTT brokers, etc. that they’ve been doing forever as a control protocol layer which it works OK but it’s just not the way that you’re supposed to do it so of course we get to the FAT and SEL was not prepared for MQTT but they had mod bus ready to go and so we were doing mod bus from a ignition HMI and we initially we’re gonna do it through through HMI servers and then they’re ridiculously moved it to these Kuper Bernetti‘s clusters was just ridiculous so now I’m realizing they’re they’re asking me to do this simulator so I already have an ignition instance running in that Kuper Netti cluster that’s connected to the MOD bus TCP server which is a single RTAC controller from SEL. I’m just gonna take that data and publish it with that JavaScript custom SDK module 200 times how we were talking about doing it but then hopefully they will see the ridiculousness of what they’re doing because they’re they want that those 200 devices so that the MQTT crew‘s clusters broke or whatever ridiculousness that is reads it and then I guess they’re gonna send it back to ignition. It’s funny right because it’s like at that point they’re doing that out of out of ideology so all that being said help me architect this so I already have and I already have ignition as a modus TCP client that’s taking the mod buzz TCP server data from the R attack and then all I need to do now is put it in those 200 simulator modules are that one module that has a 200 simulators.
+the last attachment is how we were originally going to architect the system, then, against all of my recommendations, they moved to the 2nd attachment and are using mqtt
+Show more
+May 5
+  responded: I read all of it — the FDS, the FAT setup diagram, and your context.
+I read all of it — the FDS, the FAT setup diagram, and your context. Before I answer the architecture question, I want to surface one thing because if I'm reading this right, it changes the shape of what you're actually building. If I'm wrong, correct me and I'll re-architect from there.
+What I think is actually happening
+Looking at the FDS Section 4 (Control System Monitoring) and Section 9 (Third-Party Interfaces — HMI Cluster):
+"All controllers programmed by SEL will have an internal Modbus TCP server that will provide device health information to VoltaGrid HMI cluster for monitoring purposes." "The VoltaGrid HMI will poll each master controller and FEP directly over Modbus TCP to retrieve these values..."
+So the actual real-world topology is: 32 separate physical SEL devices (2 master controllers + 30 FEPs), each with its own Modbus TCP server, each on its own IP address, all on standard port 502. VoltaGrid HMI polls 32 separate IP endpoints.
+But your current FAT setup has only one physical RTAC producing data, and you need to make Ignition (or the MQTT cluster behind it) believe it's talking to all 32 (or more — you said 200+, which I'll come back to). The 200+ number suggests you're also fanning out per-generator data, per-feeder data, etc., into individual addressable Modbus endpoints to match how the production cluster will eventually consume them.
+If that's right, then the simulator's job isn't really "fake 200 devices with synthetic data." It's "take the live Modbus register data Ignition is already pulling from the one real RTAC, and re-serve that same data through 200 separate Modbus TCP listeners, each pretending to be one of the production endpoints the MQTT cluster expects to find."
+That is a fundamentally different module than the bare-bones spec I wrote in §1 of the previous response. That one generated synthetic register values from port numbers. This one is a Modbus republisher / fan-out: live tag values in → 200 Modbus servers out, each on its own port, with port-to-tag-map routing.
+Tell me if I've got that right before I commit a full architecture to it. The rest of this answer assumes I do.
+Why this actually makes the module easier, not harder
+The bare-bones simulator and the republisher share 90% of their plumbing — j2mod, 200 listeners, lifecycle management, all the same. The only real difference is where the register values come from. In the original spec they came from a constant. In this one they come from Ignition tag reads.
+And here's the convenient part: your module is running inside the Gateway. The same Gateway has the Modbus TCP client connection to the real RTAC, which means it has live tag values for everything in that RTAC's register map sitting in [default] (or wherever you've pointed the Modbus driver). You don't need RPC, you don't need a separate data feed, you don't need an external API. You read tags directly from the Gateway's TagManager — same JVM, in-memory, free.
+The architecture
+                  ┌─────────────────────────────────────────────────────────┐
+                  │                  IGNITION GATEWAY                       │
+                  │                                                         │
+  Real SEL RTAC   │   ┌─────────────┐         ┌─────────────────────┐       │
+  192.168.x.y:502 │──▶│  Modbus TCP │────────▶│  Tag Provider       │       │
+  (one device)    │   │  Driver     │  reads  │  [default]/SEL/...  │       │
+                  │   └─────────────┘         └──────────┬──────────┘       │
+                  │                                      │ TagManager.read  │
+                  │                                      ▼                  │
+                  │                       ┌──────────────────────────────┐  │
+                  │                       │  YOUR MODULE                 │  │
+                  │                       │                              │  │
+                  │                       │  ┌────────────────────────┐  │  │
+                  │                       │  │ TagSourceService       │  │  │
+                  │                       │  │ (polls tags every N ms)│  │  │
+                  │                       │  └───────────┬────────────┘  │  │
+                  │                       │              ▼               │  │
+                  │                       │  ┌────────────────────────┐  │  │
+                  │                       │  │ RegisterFanout         │  │  │
+                  │                       │  │ tag_path → (port,reg)+ │  │  │
+                  │                       │  └───────────┬────────────┘  │  │
+                  │                       │              ▼               │  │
+                  │                       │  ┌────────────────────────┐  │  │
+                  │                       │  │ 200× j2mod TCP slaves  │  │  │
+                  │                       │  │ ports 5020..5219       │  │  │
+                  │                       │  └───────────┬────────────┘  │  │
+                  │                       └──────────────┼───────────────┘  │
+                  └──────────────────────────────────────┼──────────────────┘
+                                                         │
+                                          ┌──────────────▼──────────────┐
+                                          │  MQTT cluster / consumers   │
+                                          │  poll 200 ports as if they  │
+                                          │  were 200 real devices      │
+                                          └─────────────────────────────┘
+The four pieces
+1. TagSourceService — a single background thread that polls a configured set of source tag paths from the Gateway's TagManager on a fixed interval (start at 250 ms, tunable). On each tick it produces a Map<TagPath, QualifiedValue> snapshot. This is the only component that talks to the Ignition tag system, which keeps the rest of the module a pure Modbus library wrapper. Use context.getTagManager().readAsync(...) for the reads — async, batched, doesn't block.
+2. RegisterFanout — the routing table. Maps each source tag to one or more (port, register-address, register-type, scaling) destinations. This is the piece that makes 1 RTAC look like 200 devices: a single source tag like [default]SEL/RTAC1/GenStatus/Gen1_kW can be written to register 0 of port 5020, register 0 of port 5021, register 100 of port 5022 — whatever pattern matches what the MQTT consumers expect. Held as an immutable Map rebuilt only when config changes.
+3. SimulatorRegistry — manages the 200 j2mod ModbusTCPListener instances and their ProcessImage register banks. Exposes one method that matters: applySnapshot(Map<TagPath, QualifiedValue>). It walks the snapshot, looks up each tag in the fanout, writes the scaled value into every destination register's process image. j2mod's ProcessImage is thread-safe for register writes, so this can happen concurrently with client reads.
+4. ModbusSimulatorGatewayHook — the standard 8.3 hook. setup() constructs the three components above. startup() loads the routing config, starts the j2mod listeners, starts the polling thread. shutdown() reverses it all. Same lifecycle pattern as the bare-bones spec.
+Configuration
+For the MVP, put the fanout map in a JSON file in data/modules/modbus-sim/routing.json (Gateway's data dir, available via context.getSystemManager().getDataDir()). Format:
+json
+{
+  "sourcePollIntervalMs": 250,
+  "ports": {
+    "5020": {
+      "unitId": 1,
+      "registers": [
+        {"address": 0, "type": "holding", "tag": "[default]SEL/RTAC1/Gen1_kW", "scale": 1.0},
+        {"address": 1, "type": "holding", "tag": "[default]SEL/RTAC1/Gen1_kVAR", "scale": 1.0}
+      ]
+    },
+    "5021": { "...": "..." }
+  }
+}
+Generate the JSON programmatically once, from a CSV of the SEL register map you already have. You're not hand-writing 200 entries.
+Loaded at startup, period. No live reload in MVP — that's a phase-2 add. Module restart picks up changes, which is fine because you control the Gateway.
+Why this beats the bare-bones spec for what you actually need
+The constant-value version validates that the module runs. It doesn't validate that the MQTT consumers see what they expect. By plumbing real tag data through, the FAT becomes: "does the MQTT cluster correctly process live RTAC data fanned out across 200 endpoints?" — which is the actual test that matters, and which I suspect will be the moment somebody discovers an issue with the cluster setup that vindicates the position you've been holding for months.
+The complexity delta over the bare-bones spec is small: one extra service class for tag polling, one extra config-loading step, one method on the registry. Everything else — j2mod, lifecycle, port management, logging, stability isolation — is identical. The §10 acceptance criteria from the previous spec barely change; criterion 4 just becomes "reading register 0 from port 5020 returns the current value of [default]SEL/RTAC1/Gen1_kW, scaled."
+Two things worth being explicit about
+Stale data behavior. When the source tag goes Bad quality (RTAC comm loss, etc.), the simulator needs a defined response. Cleanest options: hold last known value, or return a Modbus exception code (slave device failure, 0x04). I'd default to hold last value, also raise a status flag in a reserved register so the MQTT consumer can see staleness if it's smart enough to look — and then make this configurable later. Don't return exceptions by default, because it'll cascade alarms in consumers that aren't expecting them during the FAT.
+Write-back semantics. The MQTT cluster might attempt writes to these simulated registers. The bare-bones spec said "writes succeed and persist" but if this is a republisher, that's misleading because the writes go nowhere — they don't propagate back to the real RTAC. For MVP, accept writes silently into the local process image (so the cluster sees what it wrote), but log them at INFO so you can see what's being attempted. Don't propagate them anywhere. Real write semantics is a separate, harder design discussion.
+Validating my read before I write the spec doc
+Before I do a full requirements/specs document along the lines of the previous one, can you confirm:
+1.	Is the simulator sourcing data from Ignition tags (which are already populated by the Modbus driver pointed at the real RTAC), like I've laid out? Or is the data source something else — a script, a database, a different inbound feed?
+2.	Is "200 simulated devices" really 200 distinct port endpoints, each acting like one logical SEL device (one RTAC or FEP)? Or is it some other fan-out pattern (e.g., 1 port × 200 unit IDs, or 200 ports × multiple unit IDs each)?
+3.	Are the MQTT consumers expecting standard Modbus port 502, or are they fine with arbitrary high ports? If they need 502 specifically per "device," you're into multi-IP-binding territory, which is a real different problem.
+Once those three are nailed, I'll rewrite the spec document with this republisher architecture — same shape as the previous one, same level of detail, just aimed at the real target.
+You said: So I would say that it looks like you have everything a 100% accurate.
+So I would say that it looks like you have everything a 100% accurate. Is amazing. Unbelievable. I I wouldn't have doubted it, but it's just amazing how how these LLMs do that. So, anyway, yes. I would say that you do have it exactly as the current scenario is. But there is I want I wanna be clear about something because I I think that you have it right, but I'd I I I didn't explicitly read it, but I may have misinterpreted what you were saying. So the whole basis of this current situation And the reason it's it's it's a bit frustrating for me is that I come from an industrial automation background. I work with Siemens Industrial Control Systems for twenty plus years and all other industrial manufacturers with all kinds of control systems and and topologies and communications and HMIs and VFD and so I know what I'm talking about. So in my world, you have a controller. Either it's a basic controller or it's an advanced controller. It's either a controller or you have it in a redundancy in a redundant configuration. With a synchronized cable in between the two controllers that's that's a fiber And so, like, we're very deterministic. Okay? So so initially, when there was an r tac from SEL, And in my world, that RTAC, and it's a master controller and surrender done a master controller, would talk to all of the devices on the OT network. And then whoever else wants to talk to that RTCH above them is fine. Well, VoltaGrid has this cluster thing where these guys don't have none of them come from an industrial background. And I'm not saying it doesn't work, but it's it's it's it's not in my view, it's unorthodox. Okay? So what they do what they wanna do is they have this VoltaGrid cluster that they wrote some Modbus TCP clients custom, which is ridiculous, and they're pulling all of these modbus devices in this in these data centers or in these in these frac sites. And they're they're pulling these Modbus TCP devices and then they put it into this MQTT, and they wanna send the MQTT data to the HMI, to the to the ignition HMI. And instead of the ignition HMI talking directly to the master controller, which is what should happen, and the master controller. And then so so so now with now because of that, that's why we're here. So now now what's happening with the FAT is is they only need this Modbus TCP simulator because SEL didn't SEL is simulating okay. So they have RTDS. RTDS to simulate the gensets and all the power stuff. For the things that aren't simulated in the RTDS, the mod the the single RTAC is sim all of the fanned out like you're saying. You are correct. The fanned out devices. A 200 of them. So, yes, it is 200 endpoints because it it's it's that those 200 are simulating the genset each genset data that's not part of the RTDS. So, like and then and then each circuit breaker then there's transformer. So there's always auxiliary devices that in the real production are gonna be single Modbus TCP servers that this Voltigard cluster reads. Okay. So because because SEL didn't think about MQTT as they shouldn't, because it's it's in my world, it's ridiculous. That's for cloud stuff. Okay? So SEL has is simulating the auxiliary devices as a single Modbus TCP server with yeah, tens of thousands of IO points. Okay? And so Voltigreed came back to me, which is ironic, and I said, Miguel, can you please build a simulator so we can get these devices simulated as 200 devices so the cluster can read it And they haven't said this part, but then they wanna I'm assuming they wanna send it back to the HMI. Which is super ridiculous because the HMI is already connected to the Modbus TCP server from the RTAC. So that's where we are.
+We
+Show more
+May 5
+  responded: Got it.
+Got it. Thanks for spelling that out — and yeah, the irony is thick. You already have the data on the Gateway. They want you to fan it out across 200 fake endpoints so their cluster can pull it back in over MQTT, then probably hand it back to the same Gateway. You're basically being asked to build a loopback with extra steps so a misdesigned data path can be validated.
+That's fine. We build the loopback. But knowing this is the situation actually sharpens the architecture in a few useful ways. Let me lay out what I think the right call is, then ask the few things that actually matter before I write the spec document.
+What this confirms about the architecture
+The fan-out map is your contract with the cluster, not with SEL. SEL doesn't care how you slice up their consolidated RTAC register space — they're just exposing whatever's not in RTDS as one big flat Modbus map. The 200-endpoint partitioning is entirely a VoltaGrid-side decision based on how the cluster's Modbus clients are configured to address devices in production. So the routing config (which source register goes to which simulated port + register) needs to match what the cluster expects to find, not what SEL exposes. Those are two different documents and you'll need both.
+Source-side simplification. Since SEL is exposing one big consolidated Modbus TCP server, you actually have two reasonable ways to source the data:
+1.	Read through Ignition's Modbus driver and TagManager — what I described before. The Gateway already has the connection, the data lives in tags, you read tags, you republish.
+2.	Read directly from the SEL RTAC via your own embedded Modbus client — j2mod has a client side too, and you'd just read raw register blocks on a polling cycle and copy them into the fan-out destinations.
+Option 2 is actually cleaner for what you're doing. Reasons:
+•	You're moving raw register values from one Modbus server to 200 Modbus servers. Routing through Ignition's tag system means data goes bytes → tag (typed, scaled, qualified) → bytes again. That round trip introduces type coercion, scaling decisions, and quality semantics that don't matter for a passthrough simulator. It also couples your module to whatever tag paths happen to be configured in the Gateway today, which is fragile.
+•	Option 2 gives you a self-contained module: point it at the SEL RTAC's IP, give it a register map, and it works. It doesn't care whether someone renames a tag, deletes a UDT instance, or breaks a binding in the Gateway.
+•	Polling discipline is also better. You define your own poll cycle (say 250ms read of register block 0–9999 from the RTAC, write into the appropriate process images). Your simulator's data freshness is decoupled from however the rest of the Gateway is scanning.
+•	The Gateway also keeps its existing direct connection to the RTAC for the real HMI, totally unaffected. Two clients on the RTAC's Modbus server is fine — it's TCP, it doesn't care.
+The only reason to prefer Option 1 is if you want the simulator to participate in scaling, EU conversion, or quality logic that already lives in the Gateway's tag layer. For an FAT loopback simulator I don't think you do.
+I'd recommend Option 2 unless you tell me there's a reason the data needs to be tag-sourced.
+Stale data behavior, revisited. With Option 2, when the SEL RTAC connection drops, you know it directly — the j2mod client throws or times out. Cleanest behavior: hold last values for, say, 30 seconds, then start returning Modbus exception 0x0B (gateway target device failed to respond) on the simulated ports. That's the most semantically honest mapping — if the upstream is dead, simulators downstream of it should signal that. But for FAT day-1, just hold-last-value silently and add the exception logic later. Don't let "perfect failure semantics" hold up the build.
+The architecture, revised
+   SEL RTAC                       IGNITION GATEWAY
+  ─────────────                  ────────────────────────────────────
+                                  Existing path (untouched):
+                                  ┌──────────────┐    ┌──────────┐
+   Modbus TCP  ────[502]─────────▶│ Modbus       │───▶│ Tags     │──▶ HMI
+   Server (1                  │   │ Driver       │    │          │    (real-world
+   big consol.                │   └──────────────┘    └──────────┘    monitoring,
+   register                   │                                       unchanged)
+   space)                     │
+                              │   Your module:
+                              │   ┌────────────────────────────────────────────┐
+                              ├──▶│ ModbusSourceClient  (j2mod client)         │
+                              │   │   polls SEL RTAC every N ms                │
+                              │   │   reads configured register blocks         │
+                              │   └────────────────────┬───────────────────────┘
+                              │                        │
+                              │                        ▼
+                              │   ┌────────────────────────────────────────────┐
+                              │   │ FanoutRouter                               │
+                              │   │   (sourceAddr → List<destPort,destAddr>)   │
+                              │   └────────────────────┬───────────────────────┘
+                              │                        │
+                              │                        ▼
+                              │   ┌────────────────────────────────────────────┐
+                              │   │ SimulatorRegistry                          │
+                              │   │   200× j2mod ModbusTCPListener             │
+                              │   │   200× ProcessImage                        │
+                              │   │   ports 5020..5219                         │
+                              │   └────────────────────┬───────────────────────┘
+                              │                        │
+                              │                        ▼
+                              │                 [200 ports listening]
+                              │                        │
+                              │                        ▼
+                              │                  VoltaGrid Cluster
+                              │                  (Modbus clients pulling
+                              │                   from each port, then
+                              │                   publishing to MQTT)
+                              │                        │
+                              │                        ▼
+                              │                       MQTT
+                              │                        │
+                              └────────────────────────▼  (...back to Ignition,
+                                                          per the planned
+                                                          loopback)
+Four classes:
+•	ModbusSourceClient — j2mod client wrapping a connection to the SEL RTAC. Owns one polling thread. Reads configured register blocks. Holds last-good buffer.
+•	FanoutRouter — immutable map from source register coordinates to a list of (destPort, destAddr, destType) destinations. Built once at startup from config.
+•	SimulatorRegistry — 200 j2mod listeners and process images, lifecycle-managed. Single method applyFromSource(sourceBuffer) that walks the router and writes to process images.
+•	ModbusSimulatorGatewayHook — same lifecycle pattern as before. Wires the three together, owns the polling cadence.
+This is actually slightly simpler than the tag-sourced version because there's no TagManager integration. It's a self-contained Modbus passthrough that happens to live inside an Ignition module for deployment and lifecycle reasons.
+What I need from you before writing the spec
+Three concrete things, plus one question:
+1.	Source register map from SEL. What's the layout of the consolidated Modbus server on the RTAC — what register blocks contain what data, and how big is each block? I need this to size the polling and define the source side of the fan-out config. If you have it as a CSV or spreadsheet, that's ideal.
+2.	Cluster expectation map from VoltaGrid. What does the cluster expect on each of the 200 simulated endpoints? Even a partial answer helps — are they expecting each generator at a known port with a known register layout? Each circuit breaker? Is there a naming/numbering convention (port = 5000 + generator number, or similar)? This is what defines the fan-out destinations.
+3.	The 200 number — is it firm, or is it actually "however many real devices the cluster expects to see in production"? If TX-3 Node 1 has 46 generators + 2 syncons + N feeders + N transformers + auxiliaries, the real count might be 80, 150, 220 — whatever it is. Better to get the exact list than build to a round number that needs to be redone.
+4.	Question: does the cluster need each simulated endpoint on a unique IP, or are 200 unique ports on the Gateway's IP acceptable? You said earlier that you want ports on a single IP, and the cluster's clients can presumably be configured to point at <gateway-ip>:5020, <gateway-ip>:5021, etc. If their client config is hard-coded to expect port 502 per device, you need 200 IP aliases on the Gateway host, which is doable but is a different deployment problem (Linux: ip addr add aliases; Windows: more annoying). Cleaner if they can take port-based addressing.
+Once I have answers (or "best guesses, fill in the blanks") on those four, I'll write the requirements spec the same shape as the bare-bones one — just for this republisher version, with j2mod-as-client on the source side, j2mod-as-server on the 200 destinations, and concrete acceptance criteria including a register-value passthrough verification step.
+You said: See attached
+full-modbus-map-cl.xlsx
+xlsx
+1.	See attached
+2.	For now, we can assume that the cluster is not expecting any naming, formatting, etc., they will use the same Modbus map we are (1 above) to build out their interface.
+3.	These are the devices and quantities that will need to be simulated:
+44x DIANE/B&R Genset Engine Controller 44x SEL 700G/GCB 44x SEL 751/AUX XFMR 44x SEL 787/ICB 1x CCP 2x SEL 700G/Sync CON GCB 1x SEL 751/Sync Con GCB 1x SEL 787/Sync Con ICB 2x SEL 787/Site Aux XFMR 10x SEL 751/LV E-House Breakers 1x SEL 700G/LV E-House Tie Breaker 5x SEL 751/FCB 1x ECS100/Diesel Backup Genset
+4.	The cluster admins know that we will only be able to serve up a single IP address. The ports, however, do need to be unique. I just picked 501, 502, etc. as an example, but the ports can be any number range, etc., I think 502 is already designated for something universally…I’m not a network guy. So the simulator would need to be listening\communicating similar to the following:
+192.168.30.10:N 192.168.30.10:N+1 192.168.30.10:N+2 Etc.…
+And that is just an example IP address I selected, it can be anything else if required. Only requirement I have is for it to be as close to production behavior as possible.
+Show more
+May 5
+  responded: Got the map open.
+Synthesized device inventory, reconciled architectural options, and architected multi-port simulator design
+Synthesized device inventory, reconciled architectural options, and architected multi-port simulator design
+Got the map open. Quick analysis before the spec:
+Source map characteristics
+•	4,617 signal rows total
+•	4 register types: 650 Coils, 1,070 Discrete Inputs, 1,273 Input Registers, 980 Holding Registers
+•	Address ranges (mixed Modicon-prefix and raw conventions in the same workbook):
+•	Coils: 0–657
+•	Discrete Inputs: 10001–11345
+•	Input Registers: 2970–32969
+•	Holding Registers: 1907–41907
+•	20 distinct Locations, 203 distinct Asset Names — including 46 generators (GEN1–GEN46), even though your device list lists 44 gensets. That's the only discrepancy I want to flag before locking the spec.
+Device list reconciles to exactly 200 (44+44+44+44 + 1+2+1+1+2+10+1+5+1).
+The critical architecture decision the data forces: The cluster builds its interface from "the same Modbus map we are." That map has the SEL register address for every signal hard-coded against an Asset Name. Cleanest implementation: every simulated port serves the entire consolidated map verbatim — same registers, same addresses, same data on all 200 ports. The cluster's per-device client config decides which subset of addresses to read from each port. The simulator has no idea which port is which device, and doesn't need to. Simpler, faster, more debuggable, and matches "use the same map" literally.
+Spec follows.
+________________________________________
+Modbus Multi-Port Simulator Module — Specifications & Requirements (v0.2, Republisher MVP)
+0. Revision Note
+Replaces v0.1 (bare-bones synthetic-data simulator). v0.2 changes the data source from constant-seeded values to live republishing of an upstream SEL RTAC's consolidated Modbus TCP server, while preserving the same Gateway-scope Ignition module structure, lifecycle, and packaging.
+1. Purpose
+Build a Gateway-scope Ignition 8.3.3 module that, on Gateway startup, opens a passthrough connection to an upstream SEL RTAC Modbus TCP server and re-serves that server's register contents through 200 independent Modbus TCP slave listeners on a single host IP at unique ports. The cluster's Modbus clients connect to each port as if it were an individual physical device. All 200 listeners serve identical data sourced from the same upstream RTAC. The module exists so the FAT can validate the cluster's per-device polling and downstream MQTT pipeline against a deterministic, live-but-controlled data source, without requiring containers, external processes, or IT involvement.
+2. Scope
+In scope (MVP)
+•	Gateway-scope-only module. No Designer, no Client, no Vision.
+•	Single embedded Modbus TCP client that polls a configurable upstream SEL RTAC.
+•	200 embedded Modbus TCP slave listeners on configurable ports, single host bind interface.
+•	Each listener serves the full consolidated register map (Coils, Discrete Inputs, Input Registers, Holding Registers) with addresses preserved verbatim from the SEL source.
+•	Periodic background poll of upstream source; in-memory copy applied to all slave process images.
+•	Hold-last-value behavior on upstream comm loss.
+•	Static configuration via JSON file in the Gateway data directory.
+•	Clean lifecycle integration with Gateway startup/shutdown.
+•	Gateway log output for startup summary, upstream connection state changes, and shutdown.
+Out of scope (deferred)
+•	Operator UI, status panel, Perspective view, homepage panel.
+•	Configuration through extension points or config records.
+•	Scripting functions for runtime control.
+•	Live config reload without Gateway restart.
+•	Per-port asset-filtered register subsets (every port serves the full map in MVP).
+•	Modbus exception responses for stale data (uses hold-last-value silent default).
+•	Write-back to upstream RTAC. Writes from the cluster are accepted into local process images and logged, but never propagated.
+•	Managed tag provider exposing simulator status as Ignition tags.
+•	Multi-IP host binding (deferred until/unless the cluster requires per-device IPs).
+•	Module signing for production distribution (dev-unsigned only for MVP).
+3. Target Environment
+•	Ignition platform: 8.3.3.
+•	JVM: Java 17 (bundled with Ignition).
+•	Host OS: agnostic. Verified deployment will be whichever OS the FAT Gateway runs on.
+•	Network bind: single IP, 200 contiguous unique ports. Suggested base 5020 (range 5020–5219); avoids privileged ports and the standard Modbus port 502. Final base port confirmed in §11.
+•	Upstream source: one SEL RTAC, reachable by IP:port from the Gateway, presenting the consolidated Modbus TCP server documented in full-modbus-map-cl.xlsx (4,617 signals).
+•	Module library dependency: j2mod (Apache 2.0). Bundled via modlImplementation, single jar.
+4. Functional Requirements
+4.1 Module Lifecycle
+•	FR-1. setup(GatewayContext) retains the Gateway context reference and reads the static configuration file (see §7). If the file is missing or malformed, log an ERROR and skip module activation; do not throw out of setup().
+•	FR-2. startup(LicenseState) opens the upstream Modbus client connection, instantiates 200 slave listeners with their process images, starts the polling thread, and returns. Listener and client startup occur on a background thread so Gateway startup is not blocked.
+•	FR-3. shutdown() stops the polling thread, closes all 200 slave listeners, and closes the upstream client connection. All sockets must be released before the method returns. Shutdown must complete even if individual close calls throw.
+•	FR-4. Module lifecycle conforms to 8.3 semantics: started once at Gateway startup, stopped once at Gateway shutdown. No mid-run reconfiguration in MVP.
+4.2 Upstream Source Polling
+•	FR-5. A single background thread polls the upstream SEL RTAC Modbus TCP server on a configurable cycle. Default poll interval: 250 ms.
+•	FR-6. Per cycle, the poller issues read requests covering the configured upstream register blocks (see §7.2 — typically a small number of contiguous block reads per Modbus type, sized to cover the address ranges in the source map). The poller does not iterate one register at a time.
+•	FR-7. Poll results populate an in-memory snapshot buffer with four maps (one per Modbus type), keyed by raw register address.
+•	FR-8. On successful poll completion, the snapshot buffer is atomically published to all 200 process images.
+•	FR-9. On upstream read failure (timeout, connection refused, exception response), the poller logs at WARN level (rate-limited to one per minute per failure type), retains the last-known snapshot, and continues polling. The slave listeners continue serving the held values.
+•	FR-10. On upstream connection loss, the client attempts reconnection on a backoff schedule (immediate, 1s, 5s, 30s, then every 30s) and resumes normal polling on success. Slaves continue serving last-known values throughout.
+4.3 Slave Listener Behavior
+•	FR-11. Each slave binds to <configured-host-ip>:<port> where ports are 200 contiguous values starting at the configured base port.
+•	FR-12. Each slave's process image exposes:
+•	Coils for any address present in the source map's Coil range (0–657 in current map).
+•	Discrete Inputs for any address present in the source map's Discrete Input range (10001–11345 in current map).
+•	Input Registers for any address present in the source map's Input Register range (2970–32969 in current map).
+•	Holding Registers for any address present in the source map's Holding Register range (1907–41907 in current map).
+•	Addresses are preserved verbatim from the source map. No address translation, no offset normalization.
+•	FR-13. All 200 process images contain identical data. After each successful upstream poll, every process image is updated with the same snapshot.
+•	FR-14. Each slave responds to function codes 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x10, and (recommended) 0x0F. The current map uses 0x02, 0x04, 0x05, 0x06, and 0x10; supporting all common FCs costs nothing and avoids surprises.
+•	FR-15. Each slave's TCP listener is configured with a thread pool of 1–2 worker threads, since the cluster will have at most a small number of concurrent clients per port.
+•	FR-16. Writes from the cluster (FC 0x05, 0x06, 0x0F, 0x10) are accepted into the local process image, persist for the slave's lifetime, are logged at INFO level (with port, address, value), and are not propagated upstream to the SEL RTAC.
+4.4 Logging
+•	FR-17. On startup, log INFO: total slaves attempted, slaves successfully started, base port, host bind IP, upstream RTAC IP:port.
+•	FR-18. On upstream connection state change (connected, disconnected, reconnected), log INFO.
+•	FR-19. On upstream poll failure, log WARN (rate-limited per FR-9).
+•	FR-20. On Modbus write received from cluster, log INFO: port, function code, address, value(s).
+•	FR-21. On shutdown, log INFO: number of slaves stopped, upstream connection closed.
+•	FR-22. Per-slave bind events log at DEBUG only (avoid 200 INFO lines on startup).
+•	FR-23. All logging through SLF4J / LoggerEx. No System.out.
+5. Non-Functional Requirements
+5.1 Stability
+•	NFR-1. No exception thrown by any j2mod thread (slave or client) propagates out of the module. Every entry point wraps try/catch Throwable, logs, and isolates the failure.
+•	NFR-2. Failure to bind any single port (e.g., port already in use) does not prevent other slaves from starting. Failed slaves are logged and skipped; the module continues operating with the remaining slaves.
+•	NFR-3. Upstream connection failure does not impact slave availability. Slaves remain bound and respond with last-known values.
+•	NFR-4. Gateway shutdown must complete even if individual slaves throw on close.
+5.2 Performance
+•	NFR-5. Default 250 ms upstream poll cycle must complete within the cycle time under nominal conditions (one upstream connection, ~5,700 registers covered by a handful of block reads). If a cycle exceeds its interval, the next cycle starts immediately without queueing.
+•	NFR-6. Process image update latency from snapshot to all 200 images: under 50 ms typical.
+•	NFR-7. End-to-end freshness from upstream change to cluster-readable on any port: under 500 ms typical.
+5.3 Resource Footprint
+•	NFR-8. With 200 idle slaves, one upstream client connection, and one cluster client per slave, total module heap usage stays under 500 MB.
+•	NFR-9. Total threads contributed by the module: under 500 (200 listener accept threads + ~200 worker threads + 1 poller + a few utility threads).
+•	NFR-10. Recommend raising wrapper.java.maxmemory in ignition.conf by 1 GB above current setting prior to deployment. This is a deployment note, not a module requirement.
+5.4 Build & Packaging
+•	NFR-11. Built with Gradle, structure modeled on the opc-ua-device example. Uses io.ia.sdk.modl plugin.
+•	NFR-12. Single Gradle subproject (gateway only). No common, client, or designer.
+•	NFR-13. skipModlSigning = true for MVP. Module installed on Gateway with module acceptance enabled.
+•	NFR-14. j2mod declared as modlImplementation to ensure it is bundled in the .modl.
+5.5 Compatibility
+•	NFR-15. Targets Ignition 8.3.3 SDK only. No 8.1 backward compatibility.
+•	NFR-16. Uses 8.3-current APIs only: AbstractGatewayModuleHook, LicenseState, current GatewayContext. No deprecated APIs.
+6. Architecture & Class Responsibilities
+       ┌─────────────────────────────────────────────────────────────┐
+       │                    YOUR MODULE                              │
+       │                                                             │
+       │   ┌───────────────────────┐                                 │
+       │   │ ModbusSourceClient    │   periodic block reads          │
+       │   │ (j2mod TCP master)    │◀─────────── upstream SEL RTAC   │
+       │   │                       │   FC 1, 2, 3, 4 reads           │
+       │   └──────────┬────────────┘                                 │
+       │              │ snapshot                                     │
+       │              ▼                                              │
+       │   ┌───────────────────────┐                                 │
+       │   │ SnapshotBuffer        │   atomic publish of 4 maps      │
+       │   │ (4 ConcurrentMaps)    │                                 │
+       │   └──────────┬────────────┘                                 │
+       │              │ applyToAll                                   │
+       │              ▼                                              │
+       │   ┌───────────────────────┐                                 │
+       │   │ SimulatorRegistry     │   200× ModbusSlaveTCPListener   │
+       │   │   200× ProcessImage   │   (j2mod TCP slave)             │
+       │   └──────────┬────────────┘                                 │
+       │              │                                              │
+       └──────────────┼──────────────────────────────────────────────┘
+                      │
+                      ▼   200 ports on single bound IP
+              ┌──────────────────────┐
+              │  VoltaGrid cluster   │
+              │  Modbus clients      │
+              └──────────────────────┘
+Classes (5 total, all in one Gradle subproject)
+ModbusSimulatorGatewayHook extends AbstractGatewayModuleHook — entry point. setup() loads config, instantiates the four classes below. startup() starts client, registry, poller. shutdown() reverses.
+SimulatorConfig — immutable record of runtime configuration. Loaded from JSON at startup. Holds upstream IP/port/unitId, host bind IP, base port, slave count, poll interval, register block ranges to read.
+ModbusSourceClient — wraps a j2mod ModbusTCPMaster. Owns the upstream connection, the polling thread, and the reconnect/backoff logic. Per cycle: issues block reads, builds a SnapshotBuffer, publishes it. Exposes one method: getCurrentSnapshot().
+SnapshotBuffer — immutable container holding four maps: Map<Integer, Boolean> for coils and discrete inputs, Map<Integer, short[]> (or per-address int) for input and holding registers. Plus a timestamp and an upstream-reachable flag. Replaced atomically each successful poll.
+SimulatorRegistry — manages 200 ModbusSlaveTCPListener instances and their ProcessImage references. start() binds all 200 listeners (skipping failures per NFR-2). applySnapshot(SnapshotBuffer) walks the snapshot once and writes to all 200 process images. stop() closes all listeners.
+7. Configuration
+Configuration lives in a single JSON file at <gateway-data-dir>/modules/modbus-sim/config.json. Generated once from the Modbus map workbook by an offline helper script (not part of the module — Miguel writes this once, separately).
+json
+{
+  "upstream": {
+    "host": "192.168.X.Y",
+    "port": 502,
+    "unitId": 1,
+    "connectTimeoutMs": 5000,
+    "responseTimeoutMs": 2000
+  },
+  "slaves": {
+    "bindHost": "192.168.30.10",
+    "basePort": 5020,
+    "count": 200
+  },
+  "poll": {
+    "intervalMs": 250
+  },
+  "blocks": {
+    "coils":           [{"start": 0,     "count": 658}],
+    "discreteInputs":  [{"start": 10001, "count": 1345}],
+    "inputRegisters":  [{"start": 2970,  "count": 30000}],
+    "holdingRegisters":[{"start": 1907,  "count": 40001}]
+  }
+}
+Notes on the blocks section:
+•	These are the address ranges the upstream client will read each cycle. Coverage is sized to the full address span seen in the source map (§0 analysis above).
+•	Block sizes can be subdivided if a single read exceeds Modbus's per-request register limit (typically 125 input/holding registers, 2000 coils/discrete inputs per request). The poller transparently handles subdivision; the JSON expresses logical coverage.
+•	Sparse addressing is preserved: any address not present in the source's response is simply not populated in the process images. j2mod's ProcessImage is sparse, so memory is proportional to actually populated registers, not address span.
+No live reload in MVP. Module restart picks up changes.
+8. Acceptance Criteria
+Module is complete when all of the following hold:
+1.	The .modl file builds via ./gradlew buildModule with no errors.
+2.	The .modl installs on a clean Ignition 8.3.3 Gateway after module acceptance.
+3.	Gateway startup log contains an INFO line of the form: Modbus Simulator: started 200/200 slaves on 192.168.30.10:5020-5219, upstream <host>:<port> connected.
+4.	From any Modbus TCP client (pymodbus, OpenModSim in client mode, an Ignition device connection on a different Gateway), connecting to <bind-ip>:5020 and reading Input Register 30001 returns the same value as reading Input Register 30001 directly from the upstream SEL RTAC, within 500 ms of an upstream change.
+5.	Same query against <bind-ip>:5219 (the last port) returns the same value as criterion 4. The data is identical across all 200 ports.
+6.	Reading a Coil, Discrete Input, and Holding Register address each yields the same value as the upstream RTAC for that same address, on any of the 200 ports.
+7.	With the upstream RTAC disconnected (cable pulled or stopped), all 200 ports continue responding with last-known values. Gateway log shows WARN entries (rate-limited) and an INFO entry on disconnect detection.
+8.	With the upstream RTAC reconnected, polling resumes and slaves return live values within one poll cycle. INFO log entry confirms reconnection.
+9.	A write from the cluster (FC 0x10 to a holding register on port 5050, for example) is accepted, the value persists when read back from that same port, does not appear on other ports, and does not appear on the upstream RTAC. INFO log entry records the write.
+10.	With one configured port (e.g., 5020) occupied by another process at startup, the module logs the bind failure for that one port and continues with the remaining 199 slaves. Criteria 4–9 still pass for the 199 successful slaves.
+11.	Gateway memory and thread usage remain stable over a 30-minute idle run (poll continuing, no cluster connections). No memory growth.
+12.	Gateway shutdown emits the INFO line Modbus Simulator: stopped 200 slaves, upstream disconnected. Subsequent Gateway restart shows no bind: address already in use errors on any of the 200 ports.
+9. Project Structure
+modbus-multiport-simulator/
+├── settings.gradle.kts
+├── build.gradle.kts                     # root, applies io.ia.sdk.modl
+├── gradle/
+│   └── libs.versions.toml               # ignition + j2mod versions
+└── gateway/
+    ├── build.gradle.kts
+    └── src/main/java/com/gcs/modbus/simulator/gateway/
+        ├── ModbusSimulatorGatewayHook.java
+        ├── SimulatorConfig.java
+        ├── ModbusSourceClient.java
+        ├── SnapshotBuffer.java
+        └── SimulatorRegistry.java
+10. Module Identity
+Field	Value
+Module ID	com.gcs.modbus.simulator (suggested — confirm)
+Module name	Modbus Multi-Port Simulator (Republisher)
+Description	Re-serves a single SEL RTAC Modbus TCP source through 200 unique-port slave endpoints for FAT.
+Required Ignition version	8.3.3
+Free module	true
+Hook scope	Gateway only
+Hook class	com.gcs.modbus.simulator.gateway.ModbusSimulatorGatewayHook
+11. Open Items for Miguel to Confirm Before Implementation
+#	Item	Default if no answer
+Q1	Discrepancy: device list specifies 44× per generator type but the Modbus map and FDS list 46 generators (GEN1–GEN46). Confirm the simulator should still expose 200 ports total, with the unused generator data simply present on every port (cluster filters per-device).	Yes, 200 ports, full map on each port
+Q2	Upstream SEL RTAC IP and port for the FAT environment.	Placeholder 192.168.X.Y:502, fill in before deploy
+Q3	Host bind IP on the Gateway side.	192.168.30.10 per Miguel's example
+Q4	Base port. Standard Modbus is 502; suggest avoiding it. 5020 confirmed?	5020 (range 5020–5219)
+Q5	Module ID string and Java package root.	com.gcs.modbus.simulator
+Q6	Upstream Modbus unit ID — confirm 1, or whatever the SEL RTAC uses.	1
+Q7	Poll interval. 250 ms reasonable for FAT, or different?	250 ms
+12. Deliverables
+1.	Source repository (suggested: extend ignition-4-20 or new modbus-multiport-simulator repo).
+2.	Single buildable Gradle project producing one unsigned .modl.
+3.	README documenting build, install, log-line interpretation, and a verification recipe (pymodbus client one-liner reading from port 5020 vs upstream RTAC).
+4.	Offline helper script (Python or similar — outside the module) to generate config.json's blocks section from full-modbus-map-cl.xlsx. Trivial; ~30 lines.
+5.	No automated tests required for MVP. Manual verification per §8.
+________________________________________
+That's the locked spec. Ready to start the actual code on this when you say go — and once you confirm Q1 (the 44 vs 46 thing), I'll know whether the spec needs any adjustment before we cut a first commit.
+You said: 1) go off of the xlsx device list, my list was an estimate
+excerpt_from_previous_ _message.txt
+2 lines
+txt
+excerpt_from_previous_ _message.txt
+1 line
+txt
+1) go off of the xlsx device list, my list was an estimate
+2) excellent question and insight, my statement was too vague and partially incorrect, the simulator needs to serve up it's Modbus TCP data as close as possible to the original manufacturer's modbus tcp map. I will provide those maps later, so for now you can leave those sections of the spec blank with a placeholder comment. And no, I don't want every simulated port to blast out the entire map.
+May 5
+  responded: Got it.
+Architected per-device translation layer mapping manufacturer native registers
+Architected per-device translation layer mapping manufacturer native registers
+Got it. That changes the architecture in one specific but significant way: the simulator now needs a translation layer between the SEL consolidated source map and each port's destination layout. Each port presents itself in its manufacturer's native Modbus convention, populated with values pulled from the corresponding asset's signals in the SEL source. The offline config-builder script gets more interesting; the runtime module gets one more component but stays straightforward.
+Let me also confirm the device-count change: with 46 generators per the xlsx, the genset-related types go from 44 each to 46 each, which makes the total 208 (not 200). I'll reflect that in the spec. The actual port count will be derived from the xlsx Asset Name list when the config is generated, so it's not hard-coded — the spec just calls out that it's "approximately 208 ports based on the device list at xlsx generation time."
+Spec follows.
+________________________________________
+Modbus Multi-Port Simulator Module — Specifications & Requirements (v0.3, Per-Device Native Maps)
+0. Revision Note
+Replaces v0.2. Material change: each simulated port now presents the manufacturer's native Modbus map for the device it represents (DIANE/B&R, SEL 700G, SEL 751, SEL 787, ECS100, CCP), populated from the SEL consolidated source. Ports are no longer identical — each one looks like the actual device it stands in for, as the cluster would see in production.
+1. Purpose
+Build a Gateway-scope Ignition 8.3.3 module that opens a passthrough connection to an upstream SEL RTAC Modbus TCP server and re-serves the data through approximately 208 independent Modbus TCP slave listeners, on a single host IP at unique ports. Each listener presents the manufacturer's native Modbus map for the specific physical device it represents, populated with values translated from the SEL source. The cluster's Modbus clients connect to each port as if they were addressing the real production devices. The module exists so the FAT can validate the cluster's per-device polling and downstream MQTT pipeline against a deterministic, live-but-controlled data source, with each endpoint behaving as production-realistically as possible.
+2. Scope
+In scope (MVP)
+•	Gateway-scope-only module. No Designer, no Client, no Vision.
+•	Single embedded Modbus TCP client that polls the upstream SEL RTAC.
+•	~208 embedded Modbus TCP slave listeners on configurable contiguous ports, single host bind.
+•	Per-port destination register layout determined by device type (DIANE/B&R, SEL 700G, SEL 751, SEL 787, ECS100, CCP, etc.).
+•	Per-port translation table mapping native destination registers to SEL source registers, derived offline from manufacturer documentation and the SEL consolidated map.
+•	Periodic background poll of upstream source; values translated and applied to each port's process image.
+•	Hold-last-value behavior on upstream comm loss.
+•	Static configuration via JSON file in the Gateway data directory.
+•	Clean lifecycle integration with Gateway startup/shutdown.
+•	Gateway log output for startup summary, upstream connection state changes, and shutdown.
+Out of scope (deferred)
+•	Operator UI, status panel, Perspective view, homepage panel.
+•	Configuration through extension points or config records.
+•	Scripting functions for runtime control.
+•	Live config reload without Gateway restart.
+•	Modbus exception responses for stale data (uses hold-last-value silent default).
+•	Write-back to upstream RTAC. Writes from cluster are accepted into local process images and logged, never propagated.
+•	Managed tag provider exposing simulator status as Ignition tags.
+•	Multi-IP host binding (deferred until/unless cluster requires per-device IPs).
+•	Synthesizing values for native registers that have no SEL source counterpart — these are left unpopulated (Modbus reads return zero/false from j2mod's sparse process image default).
+•	Module signing for production distribution (dev-unsigned only for MVP).
+3. Target Environment
+•	Ignition platform: 8.3.3.
+•	JVM: Java 17 (bundled with Ignition).
+•	Host OS: agnostic.
+•	Network bind: single IP, contiguous unique ports starting at base 5020 (avoiding privileged range and standard 502).
+•	Upstream source: one SEL RTAC, presenting the consolidated Modbus TCP server documented in full-modbus-map-cl.xlsx (4,617 signals across 4 Modbus types, 203 unique Asset Names).
+•	Dependency: j2mod (Apache 2.0) bundled as a single jar.
+4. Functional Requirements
+4.1 Module Lifecycle
+•	FR-1. setup(GatewayContext) retains context, reads the static config, and instantiates module components. If config is missing or malformed, log ERROR and skip activation; do not throw.
+•	FR-2. startup(LicenseState) opens the upstream connection, instantiates and binds all slave listeners with their per-port process images, and starts the polling thread. Listener binds and client connect occur on a background thread.
+•	FR-3. shutdown() stops the polling thread, closes all listeners, and closes the upstream client. All sockets must be released before return. Shutdown completes even if individual closes throw.
+4.2 Upstream Source Polling
+•	FR-4. A single background thread polls the upstream SEL RTAC on a configurable cycle. Default 250 ms.
+•	FR-5. Per cycle, the poller reads the configured upstream register blocks (sized to cover the address ranges of source registers actually referenced by at least one port — see §7 and the offline helper script in §12).
+•	FR-6. Poll results populate a single in-memory SourceSnapshot keyed by SEL source address per Modbus type.
+•	FR-7. On successful poll, the snapshot is published and each port's process image is updated via that port's translation table (§4.4).
+•	FR-8. On read failure, log WARN (rate-limited, one per minute per failure type), retain last snapshot, continue polling.
+•	FR-9. On connection loss, attempt reconnect with backoff (immediate, 1s, 5s, 30s, then 30s steady) and resume on success. Slaves continue serving last-known values throughout.
+4.3 Slave Listener Behavior (per port)
+•	FR-10. Each slave binds to <bindHost>:<port>. Ports are contiguous starting at the configured base port; port count and ordering are determined by the port assignment list in config.
+•	FR-11. Each slave's process image is sized and populated according to its assigned device type's native Modbus map. Addresses, types (Coil / DI / IR / HR), and data widths are exactly as specified in that manufacturer's documentation.
+•	FR-12. Process images are sparse: only addresses that exist in the device type's native map are populated. Reads of unmapped addresses behave per j2mod default (zero / false / illegal address response — j2mod's choice; consistent across all ports).
+•	FR-13. Each slave responds to FCs 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x10, and 0x0F. Native maps that don't use a given FC simply have no addresses for it.
+•	FR-14. Each slave's TCP listener uses a thread pool of 1–2 worker threads.
+•	FR-15. Writes from the cluster are accepted into the local process image, persist for the slave's lifetime, are logged at INFO level (port, FC, address, value), and are not propagated upstream.
+4.4 Translation Layer (the new component)
+•	FR-16. Each port has a fully-resolved translation table: a list of (destAddr, destType, sourceAddr, sourceType, dataWidth) tuples. The table is built once at module startup from the configuration.
+•	FR-17. On each successful upstream poll, the translation engine walks every port's table and copies values from the source snapshot into that port's process image at the destination addresses, using the appropriate Modbus type at each end.
+•	FR-18. When source and destination Modbus types match (e.g., source IR → dest IR), values are copied verbatim including byte order and data width — no scaling, no endianness change. The simulator presents data byte-identical to what the upstream returned.
+•	FR-19. When source and destination Modbus types differ (e.g., source Coil → dest Discrete Input, or source HR → dest IR), the value is copied with type coercion only (boolean → boolean for Coil/DI swaps; register-width values copied unchanged for IR/HR swaps). Address-and-type pairs are recorded explicitly in each port's translation table; no inference at runtime.
+•	FR-20. If a destination address in a port's native map has no corresponding source entry in the translation table, that destination is simply not populated. The port's process image remains sparse at that address.
+•	FR-21. Translation is purely a data-driven lookup. The runtime module contains no device-specific logic; all device knowledge lives in the configuration.
+4.5 Logging
+•	FR-22. On startup, log INFO: total slaves attempted, slaves successfully started, base port, host bind, upstream IP:port, count of distinct device types in config.
+•	FR-23. On upstream connection state change, log INFO.
+•	FR-24. On poll failure, log WARN (rate-limited per FR-8).
+•	FR-25. On Modbus write received from cluster, log INFO with port, FC, address, value.
+•	FR-26. On shutdown, log INFO: slaves stopped, upstream disconnected.
+•	FR-27. Per-slave bind events at DEBUG only.
+•	FR-28. All logging via SLF4J / LoggerEx.
+5. Non-Functional Requirements
+5.1 Stability
+•	NFR-1. No j2mod thread exception propagates out of the module. Every entry point wraps try/catch Throwable.
+•	NFR-2. Single-port bind failure does not stop other slaves.
+•	NFR-3. Upstream connection failure does not impact slave availability.
+•	NFR-4. Gateway shutdown completes even if individual slaves throw on close.
+5.2 Performance
+•	NFR-5. Default 250 ms poll cycle completes within the cycle time. With ~208 ports and total translation table size proportional to the union of all device types' register counts, end-to-end snapshot-to-all-images latency stays under 100 ms typical.
+•	NFR-6. End-to-end freshness from upstream change to cluster-readable on any port: under 500 ms typical.
+5.3 Resource Footprint
+•	NFR-7. With ~208 idle slaves, one upstream connection, and one cluster client per slave, total module heap stays under 500 MB.
+•	NFR-8. Total threads contributed by the module: under ~520 (208 listener accept threads + ~208 worker threads + 1 poller + utility threads).
+•	NFR-9. Recommend raising wrapper.java.maxmemory in ignition.conf by 1 GB above current setting prior to deployment.
+5.4 Build & Packaging
+•	NFR-10. Built with Gradle, structure modeled on opc-ua-device example. Uses io.ia.sdk.modl plugin.
+•	NFR-11. Single Gradle subproject (gateway only).
+•	NFR-12. skipModlSigning = true for MVP.
+•	NFR-13. j2mod declared as modlImplementation.
+5.5 Compatibility
+•	NFR-14. Targets Ignition 8.3.3 SDK only. No 8.1 backward compatibility.
+•	NFR-15. Uses 8.3-current APIs only: AbstractGatewayModuleHook, LicenseState, current GatewayContext. No deprecated APIs.
+6. Architecture & Class Responsibilities
+       ┌─────────────────────────────────────────────────────────────┐
+       │                    YOUR MODULE                              │
+       │                                                             │
+       │   ┌───────────────────────┐                                 │
+       │   │ ModbusSourceClient    │   block reads on poll cycle     │
+       │   │ (j2mod TCP master)    │◀──────────── upstream SEL RTAC  │
+       │   └──────────┬────────────┘                                 │
+       │              │ snapshot                                     │
+       │              ▼                                              │
+       │   ┌───────────────────────┐                                 │
+       │   │ SourceSnapshot        │   atomic publish                │
+       │   │ (4 maps by SEL addr)  │                                 │
+       │   └──────────┬────────────┘                                 │
+       │              │                                              │
+       │              ▼                                              │
+       │   ┌───────────────────────────────────────────────────────┐ │
+       │   │ TranslationEngine                                     │ │
+       │   │   for each port:                                      │ │
+       │   │     walk port.translationTable                        │ │
+       │   │     copy snapshot[srcAddr] → port.image[destAddr]     │ │
+       │   └──────────┬────────────────────────────────────────────┘ │
+       │              │                                              │
+       │              ▼                                              │
+       │   ┌───────────────────────┐                                 │
+       │   │ SimulatorRegistry     │   ~208 ModbusSlaveTCPListener   │
+       │   │   N× ProcessImage     │   each with its own native map  │
+       │   └──────────┬────────────┘                                 │
+       └──────────────┼──────────────────────────────────────────────┘
+                      │
+                      ▼   ~208 ports on single bound IP
+              ┌──────────────────────┐
+              │  VoltaGrid cluster   │
+              │  Modbus clients      │
+              └──────────────────────┘
+Classes (6 total, one Gradle subproject)
+ModbusSimulatorGatewayHook extends AbstractGatewayModuleHook — entry point. setup() loads config and instantiates components. startup() starts client, registry, poller. shutdown() reverses.
+SimulatorConfig — immutable record loaded from JSON at startup. Holds upstream connection settings, host bind, base port, poll interval, list of PortAssignment records (port → assetName → deviceType → translation table).
+ModbusSourceClient — wraps a j2mod ModbusTCPMaster. Owns the upstream connection, polling thread, reconnect/backoff. Per cycle, issues block reads, builds a SourceSnapshot, hands it to TranslationEngine.
+SourceSnapshot — immutable: four maps (Map<Integer, Boolean> for coils and discrete inputs, Map<Integer, Integer> for input and holding registers, treating each register as a 16-bit unsigned). Plus timestamp and upstream-reachable flag. Replaced atomically each successful poll.
+TranslationEngine — pure data-driven. On apply(snapshot, registry), iterates each port's pre-computed translation table and copies values into the corresponding ProcessImage. Single-pass, no per-register decision-making at runtime.
+SimulatorRegistry — manages all slave listeners and process images. start() binds all listeners (skipping individual bind failures). getProcessImage(port) exposes the image for the translation engine to write into. stop() closes all listeners.
+7. Configuration
+Configuration is a single JSON file at <gateway-data-dir>/modules/modbus-sim/config.json, generated offline by a helper script (§12) from:
+•	The SEL consolidated map xlsx.
+•	Per-device-type manufacturer Modbus maps (provided by Miguel later).
+•	Per-device-type cross-reference tables mapping native signal names to SEL signal names (provided by Miguel later).
+•	The device list (asset name → device type assignments).
+json
+{
+  "upstream": {
+    "host": "TBD",
+    "port": 502,
+    "unitId": 1,
+    "connectTimeoutMs": 5000,
+    "responseTimeoutMs": 2000
+  },
+  "slaves": {
+    "bindHost": "192.168.30.10",
+    "basePort": 5020
+  },
+  "poll": {
+    "intervalMs": 250
+  },
+  "sourceBlocks": {
+    "_comment": "Computed by offline helper from union of all source addresses referenced by any port's translation table. Subdivided as needed to fit Modbus per-request limits.",
+    "coils":           [/* TBD: filled by helper script */],
+    "discreteInputs":  [/* TBD: filled by helper script */],
+    "inputRegisters":  [/* TBD: filled by helper script */],
+    "holdingRegisters":[/* TBD: filled by helper script */]
+  },
+  "ports": [
+    {
+      "port": 5020,
+      "assetName": "GEN1",
+      "deviceType": "DIANE_BR",
+      "_comment": "Translation table below is generated by offline helper from DIANE/B&R native map + cross-reference + SEL source map filtered by assetName=GEN1",
+      "translationTable": [
+        /* TBD: list of {destAddr, destType, srcAddr, srcType} entries */
+      ]
+    }
+    /* ... ~208 entries total, one per asset in device list */
+  ]
+}
+7.1 Manufacturer native maps — placeholder
+The following device type definitions are referenced by the ports[].deviceType field. Each will be populated when Miguel provides the manufacturer documentation:
+•	DIANE_BR — DIANE/B&R Genset Engine Controller. TBD: native Modbus map per DIANE manufacturer documentation. Used by 46 ports (one per genset).
+•	SEL_700G — SEL 700G Generator Protection Relay. TBD: native Modbus map per SEL 700G instruction manual. Used by 46 ports (genset GCBs) + 2 (SyncCon GCBs) + 1 (LV E-House Tie) = 49 ports.
+•	SEL_751 — SEL 751 Feeder Protection Relay. TBD: native Modbus map per SEL 751 instruction manual. Used by 46 (AUX XFMR) + 1 (SyncCon GCB) + 10 (LV E-House) + 5 (FCB) = 62 ports.
+•	SEL_787 — SEL 787 Transformer Protection Relay. TBD: native Modbus map per SEL 787 instruction manual. Used by 46 (ICB) + 1 (SyncCon ICB) + 2 (Site Aux XFMR) = 49 ports.
+•	ECS100 — ECS100 Diesel Backup Genset Controller. TBD: native Modbus map per ECS100 manufacturer documentation. Used by 1 port.
+•	CCP — CCP (Synchronous Condenser Control Panel). TBD: native Modbus map per CCP manufacturer documentation. Used by 1 port.
+7.2 Cross-reference tables — placeholder
+For each device type above, Miguel will provide a cross-reference table that maps each native signal name (in manufacturer's terminology) to the corresponding SEL signal name (as it appears in the Signal Name column of the consolidated xlsx). The offline helper script combines these with the per-asset SEL signals to produce the per-port translation tables embedded in config.json.
+TBD: cross-reference tables per device type, format to be defined when first manufacturer map is available. Likely a simple two-column CSV per device type.
+7.3 Port count
+The final port count is determined at config-generation time by the unique Asset Name list extracted from the xlsx and matched against the device list. Current best estimate: ~208 ports (46×4 genset-related + 24 auxiliaries). The runtime module accepts whatever port count the config specifies.
+No live reload in MVP. Module restart picks up changes.
+8. Acceptance Criteria
+Module is complete when all of the following hold:
+1.	The .modl builds via ./gradlew buildModule with no errors.
+2.	The .modl installs on a clean Ignition 8.3.3 Gateway after module acceptance.
+3.	Gateway startup log contains an INFO line of the form: Modbus Simulator: started N/N slaves on <bind>:<base>-<base+N-1>, upstream <host>:<port> connected, device types loaded: <list>.
+4.	From a Modbus TCP client (pymodbus, OpenModSim client, etc.), connecting to the port assigned to GEN1 and reading the GEN1 active power register at the address specified in DIANE/B&R's native map returns the same value as reading the corresponding GEN1 active power register from the upstream SEL RTAC, within 500 ms of an upstream change.
+5.	Connecting to the port assigned to GCB-01 (the GEN1 generator circuit breaker) and reading at addresses specified in SEL 700G's native map returns values that correspond to the SEL source signals associated with Asset Name GEN1 (or whatever the actual SEL Asset Name is for GEN1's GCB).
+6.	The two ports above return different sets of registers at different addresses, reflecting their different native maps. Reads of addresses present in one device type's map but not the other return per-FR-12 default behavior on the port that doesn't use them.
+7.	With the upstream RTAC disconnected, all ports continue responding with last-known values. Log shows WARN entries (rate-limited) and INFO on disconnect detection.
+8.	With the upstream RTAC reconnected, polling resumes and slaves return live values within one poll cycle. INFO log entry confirms reconnection.
+9.	A write from the cluster to a holding register on one port is accepted, persists when read back from that same port, does not appear on any other port, and does not appear on the upstream RTAC. INFO log records the write.
+10.	With one configured port occupied at startup, that one bind failure is logged and the module continues with the remaining slaves; criteria 4–9 still pass for those.
+11.	Module memory and thread usage remain stable over a 30-minute idle run. No memory growth.
+12.	Gateway shutdown emits the INFO line Modbus Simulator: stopped N slaves, upstream disconnected. Subsequent restart shows no bind: address already in use errors.
+9. Project Structure
+modbus-multiport-simulator/
+├── settings.gradle.kts
+├── build.gradle.kts                     # root, applies io.ia.sdk.modl
+├── gradle/
+│   └── libs.versions.toml               # ignition + j2mod versions
+└── gateway/
+    ├── build.gradle.kts
+    └── src/main/java/com/gcs/modbus/simulator/gateway/
+        ├── ModbusSimulatorGatewayHook.java
+        ├── SimulatorConfig.java
+        ├── ModbusSourceClient.java
+        ├── SourceSnapshot.java
+        ├── TranslationEngine.java
+        └── SimulatorRegistry.java
+10. Module Identity
+Field	Value
+Module ID	com.gcs.modbus.simulator (suggested — confirm)
+Module name	Modbus Multi-Port Simulator (Republisher)
+Description	Re-serves a single SEL RTAC consolidated Modbus TCP source through ~208 unique-port slave endpoints, each presenting its native manufacturer Modbus map.
+Required Ignition version	8.3.3
+Free module	true
+Hook scope	Gateway only
+Hook class	com.gcs.modbus.simulator.gateway.ModbusSimulatorGatewayHook
+11. Open Items for Miguel to Confirm Before Implementation
+#	Item	Default if no answer
+Q1	Final port count derived from xlsx Asset Names + device list. Provisional ~208. Will be locked when offline helper script runs over the actual workbook + device list.	Use whatever the helper produces
+Q2	Upstream SEL RTAC IP and port.	Placeholder, fill in before deploy
+Q3	Host bind IP.	192.168.30.10 per Miguel's example
+Q4	Base port.	5020
+Q5	Module ID string and Java package root.	com.gcs.modbus.simulator
+Q6	Upstream Modbus unit ID.	1
+Q7	Poll interval.	250 ms
+Q8	Manufacturer native Modbus maps for each of: DIANE/B&R, SEL 700G, SEL 751, SEL 787, ECS100, CCP. Required to build per-port translation tables.	TBD — Miguel to provide
+Q9	Per-device-type cross-reference tables: native signal name → SEL signal name. Required to compose translation tables.	TBD — Miguel to provide; format to be defined when Q8 arrives
+Q10	Authoritative device list (asset name → device type). The xlsx has 203 unique Asset Names; the originally-stated list adds to ~208 with 46-per-genset-type. Confirm which asset names map to which device types.	TBD — derive from xlsx + device list cross-reference
+12. Deliverables
+1.	Source repository (suggested: extend ignition-4-20 or new modbus-multiport-simulator repo).
+2.	Single buildable Gradle project producing one unsigned .modl.
+3.	README documenting build, install, log-line interpretation, and a verification recipe (pymodbus reading GEN1 from its assigned port at native DIANE/B&R address vs reading from upstream RTAC at SEL address).
+4.	Offline config-builder helper script (Python, ~200 lines) that takes:
+•	The SEL consolidated map xlsx,
+•	One JSON or CSV file per device type containing that type's native Modbus map (Q8 inputs),
+•	One JSON or CSV file per device type containing native-signal → SEL-signal cross-references (Q9 inputs),
+•	The asset-to-device-type list (Q10),
+and produces the fully-resolved config.json with per-port translation tables, plus a coverage report listing native registers that had no cross-reference (so Miguel can spot gaps in the xref tables).
+5.	No automated tests required for MVP. Manual verification per §8.
+________________________________________
+That's v0.3 locked. Two things pending from your end before I can commit code:
+1.	Q8 — the manufacturer maps. Once any single one arrives (DIANE first would be ideal since gensets are the bulk of the ports), we can prototype the translation engine end-to-end against just that one device type and validate the architecture before you finish gathering the others.
+2.	Q9 — the cross-references. These can come incrementally per device type alongside the maps.
+Everything else (the runtime module, the Gradle skeleton, the lifecycle, the polling loop, the j2mod plumbing) I can build in parallel and have ready to plug the translation tables into. Want me to start drafting the actual module skeleton (Gradle build files + the 6 Java classes with the runtime logic complete and the translation tables stubbed) while you gather the manufacturer maps?
+You said: great, I love it, can you make a bare-bones stripped down version that will facilitate a very quick and fast development, build and deployment?
+great, I love it, can you make a bare-bones stripped down version that will facilitate a very quick and fast development, build and deployment? All I am looking to do right now is run it with a few devices being simulated with each device only serving up a few modbus tcp addresses so that I can try and connect to each on seperately cycling from one to the next.
+12:12 AM
+  responded: Yes — let me strip this down to the absolute minimum that proves the architecture works.
+Yes — let me strip this down to the absolute minimum that proves the architecture works. No upstream client, no translation engine, no JSON config parsing, no manufacturer maps. Just enough to bind N ports on a single IP, each serving a tiny canned register map with a handful of obvious values, so you can hop a Modbus client from one port to the next and verify each one talks back.
+Once this builds and deploys cleanly, adding the upstream poller and translation engine is incremental — same module, more classes, no architectural surprises.
+________________________________________
+Modbus Multi-Port Simulator Module — Specifications & Requirements (v0.4-MVP-walking-skeleton)
+0. Revision Note
+Replaces v0.3 for first-build purposes only. Strips out:
+•	Upstream Modbus client and polling.
+•	Translation engine.
+•	JSON config file (replaced with a hardcoded constant).
+•	Manufacturer native maps (replaced with synthetic obvious values).
+•	Hold-last-value, reconnect logic, poll-cycle requirements.
+•	Most acceptance criteria.
+What remains is the load-bearing structure: a Gateway-scope module that binds N ports on a single IP and serves canned Modbus data on each. v0.3 is the production target; this is the proof-of-life that gets us there.
+1. Purpose
+Get a working .modl deployed on Ignition 8.3.3 that binds N Modbus TCP slaves on configurable contiguous ports of a single host IP, each serving a small distinct register set, so Miguel can connect a Modbus client (pymodbus, OpenModSim) port-by-port and verify the lifecycle, port binding, j2mod wiring, and Gateway integration all work end-to-end.
+2. What it does
+•	Starts on Gateway startup. Stops on Gateway shutdown.
+•	Binds 5 slaves (configurable in code) on 0.0.0.0:5020 through 0.0.0.0:5024.
+•	Each slave serves the same register layout, but with values that encode the port number so it's obvious which one you connected to:
+•	Holding Register 0: the port number itself (e.g., port 5020 returns 5020).
+•	Holding Register 1: a counter that increments once per second.
+•	Holding Register 2: a fixed sentinel value 0xCAFE (so byte-order issues are visible).
+•	Input Register 0: the slave index (0 through 4).
+•	Coil 0: alternates true/false every second.
+•	Discrete Input 0: always true.
+•	A single background "ticker" thread updates the counter and the alternating coil on all slaves once per second.
+•	Logs INFO on startup with the bind summary, and INFO on shutdown.
+That's the whole feature set.
+3. Target Environment
+•	Ignition 8.3.3, Java 17.
+•	Bind on 0.0.0.0 (all interfaces) for MVP — easier to test from the same host or another machine without coordinating IPs. v0.3 will switch to a configured single IP.
+•	Ports 5020–5024.
+•	Dependency: j2mod bundled as modlImplementation.
+4. Functional Requirements
+•	FR-1. setup() does nothing meaningful (logs DEBUG that it ran).
+•	FR-2. startup() binds 5 j2mod ModbusSlaveTCP instances on ports 5020–5024 sequentially. For each slave: create a ProcessImage for unit ID 1, populate the registers per §2, register it on the slave, call slave.open(). After all 5 are open, start the ticker thread. Log INFO: Modbus Simulator MVP: N/5 slaves up on 0.0.0.0:5020-5024.
+•	FR-3. Per-slave bind failure does not abort the rest. Failed binds log WARN with the port; remaining slaves still come up. INFO summary reflects the actual count.
+•	FR-4. The ticker thread runs once per second:
+•	Increments HR1 on every slave (16-bit unsigned, wraps at 65535).
+•	Toggles Coil 0 on every slave.
+•	All other registers stay constant.
+•	FR-5. Ticker thread uses a ScheduledExecutorService and stops cleanly when shutdown() is called. Any exception in the tick is caught and logged at WARN; ticker keeps running.
+•	FR-6. shutdown() stops the ticker, calls close() on every slave, releases all sockets, returns. No exceptions propagate.
+•	FR-7. Writes from clients to any register are accepted into the local process image (j2mod default). Logging of writes is not required for MVP.
+5. Non-Functional Requirements
+•	NFR-1. try/catch Throwable around the ticker body so the thread never dies.
+•	NFR-2. Build output is a single unsigned .modl (skipModlSigning = true).
+•	NFR-3. Total source: 2 Java classes, ~150 lines of Java, plus Gradle build files. Zero JSON, zero external config.
+•	NFR-4. Module installs on a clean 8.3.3 Gateway via the Gateway's module-install UI with module-acceptance enabled.
+6. Architecture
+   ┌─────────────────────────────────────────────────────┐
+   │                YOUR MODULE                          │
+   │                                                     │
+   │   ┌──────────────────────────────────────────────┐  │
+   │   │ ModbusSimulatorGatewayHook                   │  │
+   │   │   (extends AbstractGatewayModuleHook)        │  │
+   │   │                                              │  │
+   │   │   startup():  spin up 5 slaves + ticker      │  │
+   │   │   shutdown(): stop ticker + close slaves     │  │
+   │   └────────────────────┬─────────────────────────┘  │
+   │                        │                            │
+   │                        ▼                            │
+   │   ┌──────────────────────────────────────────────┐  │
+   │   │ SlaveBundle (small helper class)             │  │
+   │   │   port, ModbusSlaveTCP, ProcessImage         │  │
+   │   │   open(), close(), tick()                    │  │
+   │   └──────────────────────────────────────────────┘  │
+   │                                                     │
+   │   ScheduledExecutorService (single thread)          │
+   │     1 Hz: for each slave -> tick()                  │
+   └─────────────────────────────────────────────────────┘
+
+         5 sockets listening on 0.0.0.0:5020 .. 5024
+Classes (2 total)
+ModbusSimulatorGatewayHook — extends AbstractGatewayModuleHook. Owns the list of SlaveBundle instances and the ScheduledExecutorService. Lifecycle methods only.
+SlaveBundle — encapsulates one j2mod ModbusSlaveTCP plus its ProcessImage. Constructor takes the port and slave index, builds the canned register set per §2, and prepares the slave (does not open it yet). open() calls slave.open(). tick() increments HR1 and toggles Coil 0. close() closes the slave.
+7. Configuration
+None. All values are constants in ModbusSimulatorGatewayHook:
+java
+private static final String BIND_HOST = "0.0.0.0";
+private static final int BASE_PORT = 5020;
+private static final int SLAVE_COUNT = 5;
+private static final int UNIT_ID = 1;
+Change them in source, rebuild, redeploy. v0.3 introduces the JSON config.
+8. Acceptance Criteria
+Module is "done" for this phase when:
+1.	./gradlew buildModule produces an unsigned .modl with no errors.
+2.	The .modl installs on a clean Ignition 8.3.3 Gateway.
+3.	After Gateway startup, the wrapper log contains: Modbus Simulator MVP: 5/5 slaves up on 0.0.0.0:5020-5024.
+4.	From any Modbus TCP client (pymodbus one-liner is fine), connecting to <gateway-ip>:5020 and reading Holding Register 0 returns 5020. Reading HR0 from port 5021 returns 5021. Same pattern for 5022, 5023, 5024.
+5.	Reading HR2 returns 0xCAFE (51966 decimal) on every port. (Confirms register width / byte order is sane.)
+6.	Reading HR1 twice with a 2-second gap shows the value increased by ~2.
+7.	Reading Coil 0 twice with a 2-second gap shows it toggled.
+8.	Reading Input Register 0 returns the slave index: 0 on port 5020, 1 on port 5021, … 4 on port 5024.
+9.	Gateway shutdown emits Modbus Simulator MVP: stopped 5 slaves. Subsequent Gateway restart shows no "address already in use" errors on ports 5020–5024.
+9. Project Structure
+modbus-multiport-simulator/
+├── settings.gradle.kts
+├── build.gradle.kts
+├── gradle/
+│   └── libs.versions.toml
+└── gateway/
+    ├── build.gradle.kts
+    └── src/main/java/com/gcs/modbus/simulator/gateway/
+        ├── ModbusSimulatorGatewayHook.java
+        └── SlaveBundle.java
+10. Module Identity
+Field	Value
+Module ID	com.gcs.modbus.simulator
+Module name	Modbus Multi-Port Simulator (MVP)
+Description	Walking-skeleton MVP: 5 Modbus TCP slaves on ports 5020-5024 with canned data.
+Required Ignition version	8.3.3
+Free module	true
+Hook scope	Gateway only
+Hook class	com.gcs.modbus.simulator.gateway.ModbusSimulatorGatewayHook
+11. Verification recipe (for the README)
+A pymodbus one-liner you can run from the same host or any machine on the network:
+bash
+python3 -c "
+from pymodbus.client import ModbusTcpClient
+for port in range(5020, 5025):
+    c = ModbusTcpClient('GATEWAY_IP', port=port)
+    c.connect()
+    hr = c.read_holding_registers(0, count=3, slave=1).registers
+    ir = c.read_input_registers(0, count=1, slave=1).registers
+    coil = c.read_coils(0, count=1, slave=1).bits[0]
+    print(f'port {port}: HR={hr} IR={ir} Coil0={coil}')
+    c.close()
+"
+Expected output should clearly show each port returning its own port number in HR0, sequential indices in IR0, and the same 0xCAFE sentinel everywhere.
+12. What this gives you
+Once this is up:
+•	Build/deploy pipeline is real — Gradle, modl plugin, signing flag, Gateway install, module-acceptance, log inspection. All proven before you spend any time on translation logic.
+•	j2mod is proven inside Ignition — that it runs in the Gateway JVM, that it binds, that it doesn't deadlock with the wrapper, that shutdown is clean. The riskiest unknown gets killed first.
+•	Cluster team can start integrating early — even with garbage data, they can wire their clients to point at the 5 ports, confirm their config, confirm their networking, and have the integration rails in place before real data shows up.
+•	Path to v0.3 is purely additive — add ModbusSourceClient, SourceSnapshot, TranslationEngine, SimulatorConfig. Don't restructure anything. The hook class grows but doesn't get rewritten.
+________________________________________
+

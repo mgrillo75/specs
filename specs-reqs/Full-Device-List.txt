@@ -1,0 +1,13 @@
+46x DIANE/B&R
+46x SEL 700G/GCB
+46x SEL 751/AUX XFMR
+46x SEL 787/ICB
+1x  CCP
+2x  SEL 700G/Sync CON GCB
+1x  SEL 751/Sync Con GCB
+1x  SEL 787/Sync Con ICB
+2x  SEL 787/Site Aux XFMR
+10x SEL 751/LV E-House Breakers
+1x  SEL 700G/LV E-House Tie Breaker
+5x  SEL 751/FCB
+1x  ECS100/Diesel Backup Genset
